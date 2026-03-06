@@ -1,8 +1,9 @@
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
 /// Gemini API Key.
 ///
-/// Set via `--dart-define=GEMINI_API_KEY=your_key` at build time,
-/// or enter it in the app settings dialog at runtime.
-const String geminiApiKey = 'AIzaSyCkdjiS_zTHLdR5Ir7KReHqVDYWTRM87Jc';
+/// Loaded from .env file at runtime.
+String get geminiApiKey => dotenv.env['GEMINI_API_KEY'] ?? '';
 
 /// Gemini model for the Live API.
 const String geminiModel = 'gemini-2.5-flash-native-audio-preview-12-2025';
