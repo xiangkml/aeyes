@@ -2,11 +2,13 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../config.dart';
 import '../services/audio_service.dart';
+import '../services/camera_frame_service.dart';
 import '../services/gemini_live_service.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -17,15 +19,22 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  static const _frameCadence = Duration(milliseconds: 400);
+
   final GeminiLiveService _gemini = GeminiLiveService();
   final AudioService _audio = AudioService();
+  final FrameSendScheduler<CameraImage> _frameScheduler =
+      FrameSendScheduler(minInterval: _frameCadence);
 
   CameraController? _camCtrl;
-  Timer? _frameTimer;
+  Timer? _frameTickTimer;
+  Timer? _fallbackFrameTimer;
 
   bool _isActive = false;
-  bool _isCapturing = false;
+  bool _isStreamingFrames = false;
   String _status = 'Tap to start';
+  String _partialTranscript = '';
+  final List<String> _transcriptHistory = [];
 
   StreamSubscription? _audioSub;
   StreamSubscription? _textSub;
@@ -42,7 +51,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _stopSession();
+    _stopSession(updateUi: false);
     _camCtrl?.dispose();
     _gemini.dispose();
     _audio.dispose();
@@ -56,11 +65,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Camera ─────────────────────────────────────────────────────────
-
   Future<void> _initCamera() async {
     final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
+    if (cameras.isEmpty) {
+      return;
+    }
 
     final camera = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
@@ -71,25 +80,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888,
     );
 
     try {
       await _camCtrl!.initialize();
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (_) {
-      setState(() => _status = 'Camera not available');
+      if (mounted) {
+        setState(() => _status = 'Camera not available');
+      }
     }
   }
-
-  // ── Permissions ────────────────────────────────────────────────────
 
   Future<bool> _requestPermissions() async {
     final camera = await Permission.camera.request();
     final mic = await Permission.microphone.request();
     return camera.isGranted && mic.isGranted;
   }
-
-  // ── Session control ────────────────────────────────────────────────
 
   Future<void> _toggle() async {
     if (_isActive) {
@@ -108,24 +120,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       _status = 'Connecting...';
       _isActive = true;
+      _partialTranscript = '';
+      _transcriptHistory.clear();
     });
 
     _cancelSubscriptions();
+    _frameScheduler.clear();
 
-    _stateSub = _gemini.stateStream.listen((s) {
-      if (!mounted) return;
+    _stateSub = _gemini.stateStream.listen((state) {
+      if (!mounted) {
+        return;
+      }
+
       setState(() {
-        switch (s) {
+        switch (state) {
           case GeminiConnectionState.connecting:
             _status = 'Connecting...';
+            break;
           case GeminiConnectionState.ready:
             _status = 'Listening...';
+            break;
           case GeminiConnectionState.error:
             _status = 'Connection error';
             _isActive = false;
+            break;
           case GeminiConnectionState.disconnected:
             _status = 'Disconnected';
             _isActive = false;
+            break;
         }
       });
     });
@@ -134,21 +156,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _turnSub = _gemini.turnCompleteStream.listen((_) {
       _audio.onTurnComplete();
+      if (_partialTranscript.trim().isEmpty || !mounted) {
+        return;
+      }
+      setState(() {
+        _transcriptHistory.insert(0, _partialTranscript.trim());
+        if (_transcriptHistory.length > 4) {
+          _transcriptHistory.removeLast();
+        }
+        _partialTranscript = '';
+      });
     });
 
-    _textSub = _gemini.textResponseStream.listen((t) {
-      debugPrint('Gemini: $t');
+    _textSub = _gemini.outputTranscriptStream.listen((event) {
+      if (event.type != GeminiTranscriptType.outputAudio || !mounted) {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _partialTranscript = event.text;
+      });
     });
 
     try {
       await _gemini.connect(geminiApiKey);
-
       await _audio.startRecording((data) {
+        if (_audio.hasPendingPlayback && _looksLikeUserSpeech(data)) {
+          _audio.clearPlayback();
+        }
         _gemini.sendAudio(data);
       });
-
-      _startFrameCapture();
-    } catch (e) {
+      await _startVisualFeed();
+    } catch (_) {
       if (mounted) {
         setState(() {
           _status = 'Failed to connect';
@@ -158,40 +199,106 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _startFrameCapture() {
-    _frameTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      if (!_isActive || _isCapturing) return;
-      if (_camCtrl == null || !_camCtrl!.value.isInitialized) return;
+  Future<void> _startVisualFeed() async {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
 
-      _isCapturing = true;
+    if (defaultTargetPlatform == TargetPlatform.android) {
       try {
-        final xFile = await _camCtrl!.takePicture();
-        final bytes = await File(xFile.path).readAsBytes();
+        await controller.startImageStream((image) {
+          _frameScheduler.push(image);
+        });
+        _isStreamingFrames = true;
+        _frameTickTimer?.cancel();
+        _frameTickTimer = Timer.periodic(_frameCadence, (_) {
+          unawaited(_frameScheduler.dispatchLatest((image) async {
+            if (!_isActive) {
+              return;
+            }
+            final jpegBytes = await encodeCameraImageToJpeg(image);
+            if (jpegBytes != null && _isActive) {
+              _gemini.sendImage(jpegBytes);
+            }
+          }));
+        });
+        return;
+      } catch (_) {
+        _isStreamingFrames = false;
+      }
+    }
+
+    _startFallbackFrameCapture();
+  }
+
+  void _startFallbackFrameCapture() {
+    _fallbackFrameTimer?.cancel();
+    _fallbackFrameTimer = Timer.periodic(_frameCadence, (_) async {
+      if (!_isActive) {
+        return;
+      }
+      final controller = _camCtrl;
+      if (controller == null || !controller.value.isInitialized) {
+        return;
+      }
+
+      try {
+        final file = await controller.takePicture();
+        final bytes = await File(file.path).readAsBytes();
         _gemini.sendImage(bytes);
         try {
-          await File(xFile.path).delete();
+          await File(file.path).delete();
         } catch (_) {}
       } catch (_) {
-        // skip frame
-      } finally {
-        _isCapturing = false;
+        // Ignore frame capture failures and keep the session alive.
       }
     });
   }
 
-  void _stopSession() {
-    _frameTimer?.cancel();
-    _frameTimer = null;
+  bool _looksLikeUserSpeech(Uint8List pcmData) {
+    if (pcmData.length < 2) {
+      return false;
+    }
+
+    var peak = 0;
+    final data = ByteData.sublistView(pcmData);
+    for (var i = 0; i <= pcmData.length - 2; i += 2) {
+      final sample = data.getInt16(i, Endian.little).abs();
+      if (sample > peak) {
+        peak = sample;
+      }
+    }
+
+    return peak > 5000;
+  }
+
+  void _stopSession({bool updateUi = true}) {
+    _frameTickTimer?.cancel();
+    _frameTickTimer = null;
+    _fallbackFrameTimer?.cancel();
+    _fallbackFrameTimer = null;
+    _frameScheduler.clear();
     _audio.stopRecording();
     _audio.clearPlayback();
     _gemini.disconnect();
     _cancelSubscriptions();
 
-    if (mounted) {
+    final controller = _camCtrl;
+    if (_isStreamingFrames && controller != null) {
+      _isStreamingFrames = false;
+      unawaited(controller.stopImageStream());
+    }
+
+    if (updateUi && mounted) {
       setState(() {
         _isActive = false;
         _status = 'Tap to start';
+        _partialTranscript = '';
       });
+    } else {
+      _isActive = false;
+      _partialTranscript = '';
     }
   }
 
@@ -202,25 +309,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _stateSub?.cancel();
   }
 
-  // ── UI ─────────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
-    final cameraReady =
-        _camCtrl != null && _camCtrl!.value.isInitialized;
+    final cameraReady = _camCtrl != null && _camCtrl!.value.isInitialized;
+    final transcriptLines = [
+      if (_partialTranscript.trim().isNotEmpty) _partialTranscript.trim(),
+      ..._transcriptHistory,
+    ];
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Camera preview
           if (cameraReady)
             CameraPreview(_camCtrl!)
           else
             const Center(child: CircularProgressIndicator()),
-
-          // Top bar
           Positioned(
             top: 0,
             left: 0,
@@ -229,10 +334,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Padding(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
+                child: const Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
+                    Text(
                       'AEyes',
                       style: TextStyle(
                         color: Colors.white,
@@ -240,14 +345,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-
                   ],
                 ),
               ),
             ),
           ),
-
-          // Bottom controls
           Positioned(
             bottom: 0,
             left: 0,
@@ -267,7 +369,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Status
+                  if (transcriptLines.isNotEmpty)
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 20),
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withAlpha(170),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: Colors.white24),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: transcriptLines
+                            .map(
+                              (line) => Padding(
+                                padding: const EdgeInsets.only(bottom: 8),
+                                child: Text(
+                                  line,
+                                  style: TextStyle(
+                                    color: line == _partialTranscript.trim()
+                                        ? Colors.white
+                                        : Colors.white70,
+                                    fontSize: 14,
+                                    fontWeight: line == _partialTranscript.trim()
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                  ),
+                                ),
+                              ),
+                            )
+                            .toList(),
+                      ),
+                    ),
                   Semantics(
                     liveRegion: true,
                     child: Text(
@@ -281,8 +415,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   ),
                   const SizedBox(height: 24),
-
-                  // Start / Stop button
                   Semantics(
                     label: _isActive
                         ? 'Stop AEyes assistant'
