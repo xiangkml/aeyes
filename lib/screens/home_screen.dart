@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -19,7 +18,8 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
-  static const _frameCadence = Duration(milliseconds: 400);
+  static const _frameCadence = Duration(milliseconds: 450);
+  static const _scanDuration = Duration(seconds: 8);
 
   final GeminiLiveService _gemini = GeminiLiveService();
   final AudioService _audio = AudioService();
@@ -28,13 +28,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   CameraController? _camCtrl;
   Timer? _frameTickTimer;
-  Timer? _fallbackFrameTimer;
+  Timer? _scanTimer;
 
   bool _isActive = false;
   bool _isStreamingFrames = false;
   String _status = 'Tap to start';
-  String _partialTranscript = '';
-  final List<String> _transcriptHistory = [];
+  String _lastTranscript = '';
+  String _lastError = '';
+  String _sceneSummary = '';
+  int _audioChunksSent = 0;
+  int _framesSent = 0;
+  int _audioChunksReceived = 0;
+  double _minZoom = 1;
+  double _maxZoom = 1;
+  double _zoomLevel = 1;
+  double _baseScale = 1;
+  bool _scanStarted = false;
+  bool _awaitingSceneSummary = false;
+  final StringBuffer _summaryBuffer = StringBuffer();
 
   StreamSubscription? _audioSub;
   StreamSubscription? _textSub;
@@ -80,19 +91,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
+      imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
+          ? ImageFormatGroup.bgra8888
+          : ImageFormatGroup.yuv420,
     );
 
     try {
       await _camCtrl!.initialize();
+      _minZoom = await _camCtrl!.getMinZoomLevel();
+      _maxZoom = await _camCtrl!.getMaxZoomLevel();
+      _zoomLevel = _minZoom;
       if (mounted) {
         setState(() {});
       }
-    } catch (_) {
+    } catch (error) {
       if (mounted) {
-        setState(() => _status = 'Camera not available');
+        setState(() {
+          _status = 'Camera not available';
+          _lastError = '$error';
+        });
       }
     }
   }
@@ -113,16 +130,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _startSession() async {
     if (!await _requestPermissions()) {
-      setState(() => _status = 'Permissions denied');
+      if (mounted) {
+        setState(() {
+          _status = 'Permissions denied';
+          _lastError = 'Camera or microphone permission denied';
+        });
+      }
       return;
     }
 
-    setState(() {
-      _status = 'Connecting...';
-      _isActive = true;
-      _partialTranscript = '';
-      _transcriptHistory.clear();
-    });
+    if (mounted) {
+      setState(() {
+        _status = 'Connecting...';
+        _isActive = true;
+        _lastError = '';
+        _lastTranscript = '';
+        _sceneSummary = '';
+        _audioChunksSent = 0;
+        _framesSent = 0;
+        _audioChunksReceived = 0;
+        _scanStarted = false;
+        _awaitingSceneSummary = false;
+      });
+    }
 
     _cancelSubscriptions();
     _frameScheduler.clear();
@@ -131,7 +161,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) {
         return;
       }
-
       setState(() {
         switch (state) {
           case GeminiConnectionState.connecting:
@@ -143,6 +172,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           case GeminiConnectionState.error:
             _status = 'Connection error';
             _isActive = false;
+            _lastError = _gemini.lastCloseReason ?? 'Gemini stream error';
             break;
           case GeminiConnectionState.disconnected:
             _status = 'Disconnected';
@@ -152,153 +182,168 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       });
     });
 
-    _audioSub = _gemini.audioResponseStream.listen(_audio.addAudioChunk);
+    _audioSub = _gemini.audioResponseStream.listen((chunk) {
+      _audio.addAudioChunk(chunk);
+      if (mounted) {
+        setState(() {
+          _audioChunksReceived++;
+        });
+      }
+    });
 
     _turnSub = _gemini.turnCompleteStream.listen((_) {
       _audio.onTurnComplete();
-      if (_partialTranscript.trim().isEmpty || !mounted) {
-        return;
-      }
-      setState(() {
-        _transcriptHistory.insert(0, _partialTranscript.trim());
-        if (_transcriptHistory.length > 4) {
-          _transcriptHistory.removeLast();
-        }
-        _partialTranscript = '';
-      });
+      _handleTurnComplete();
     });
 
-    _textSub = _gemini.outputTranscriptStream.listen((event) {
-      if (event.type != GeminiTranscriptType.outputAudio || !mounted) {
-        return;
-      }
-      if (!mounted) {
+    _textSub = _gemini.textResponseStream.listen((text) {
+      if (!mounted || text.isEmpty) {
         return;
       }
       setState(() {
-        _partialTranscript = event.text;
+        _lastTranscript = text;
       });
+      if (_awaitingSceneSummary) {
+        _summaryBuffer.write(text);
+      }
+      debugPrint('Gemini: $text');
     });
 
     try {
       await _gemini.connect(geminiApiKey);
       await _audio.startRecording((data) {
-        if (_audio.hasPendingPlayback && _looksLikeUserSpeech(data)) {
-          _audio.clearPlayback();
-        }
         _gemini.sendAudio(data);
+        if (mounted) {
+          setState(() {
+            _audioChunksSent++;
+          });
+        }
       });
-      await _startVisualFeed();
-    } catch (_) {
+      await _startFrameStream();
+      _startSceneScan();
+    } catch (error) {
       if (mounted) {
         setState(() {
           _status = 'Failed to connect';
           _isActive = false;
+          _lastError = '$error';
         });
       }
+      await _stopFrameStream();
     }
   }
 
-  Future<void> _startVisualFeed() async {
+  void _startSceneScan() {
+    if (_scanStarted || !_isActive || !_gemini.isReady) {
+      return;
+    }
+    _scanStarted = true;
+    _gemini.sendText(_gemini.startupScanPrompt);
+    if (mounted) {
+      setState(() {
+        _status = 'Scan surroundings slowly...';
+      });
+    }
+    _scanTimer?.cancel();
+    _scanTimer = Timer(_scanDuration, _requestSceneSummary);
+  }
+
+  void _requestSceneSummary() {
+    if (!_isActive || !_gemini.isReady) {
+      return;
+    }
+    _summaryBuffer.clear();
+    _awaitingSceneSummary = true;
+    _gemini.sendText(_gemini.sceneSummaryPrompt);
+    if (mounted) {
+      setState(() {
+        _status = 'Building scene summary...';
+      });
+    }
+  }
+
+  void _handleTurnComplete() {
+    if (!_awaitingSceneSummary) {
+      return;
+    }
+    _awaitingSceneSummary = false;
+    final summary = _summaryBuffer.toString().trim();
+    _summaryBuffer.clear();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      if (summary.isNotEmpty) {
+        _sceneSummary = summary;
+      }
+      _status = 'Listening...';
+    });
+  }
+
+  Future<void> _startFrameStream() async {
     final controller = _camCtrl;
     if (controller == null || !controller.value.isInitialized) {
       return;
     }
 
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      try {
-        await controller.startImageStream((image) {
-          _frameScheduler.push(image);
-        });
-        _isStreamingFrames = true;
-        _frameTickTimer?.cancel();
-        _frameTickTimer = Timer.periodic(_frameCadence, (_) {
-          unawaited(_frameScheduler.dispatchLatest((image) async {
-            if (!_isActive) {
-              return;
+    await _stopFrameStream();
+    await controller.startImageStream((image) {
+      _frameScheduler.push(image);
+    });
+    _isStreamingFrames = true;
+
+    _frameTickTimer = Timer.periodic(_frameCadence, (_) {
+      unawaited(
+        _frameScheduler.dispatchLatest((image) async {
+          if (!_isActive || !_gemini.isReady) {
+            return;
+          }
+          final jpegBytes = await encodeCameraImageToJpeg(image);
+          if (jpegBytes != null && _isActive) {
+            _gemini.sendImage(jpegBytes);
+            if (mounted) {
+              setState(() {
+                _framesSent++;
+              });
             }
-            final jpegBytes = await encodeCameraImageToJpeg(image);
-            if (jpegBytes != null && _isActive) {
-              _gemini.sendImage(jpegBytes);
-            }
-          }));
-        });
-        return;
-      } catch (_) {
-        _isStreamingFrames = false;
-      }
-    }
-
-    _startFallbackFrameCapture();
-  }
-
-  void _startFallbackFrameCapture() {
-    _fallbackFrameTimer?.cancel();
-    _fallbackFrameTimer = Timer.periodic(_frameCadence, (_) async {
-      if (!_isActive) {
-        return;
-      }
-      final controller = _camCtrl;
-      if (controller == null || !controller.value.isInitialized) {
-        return;
-      }
-
-      try {
-        final file = await controller.takePicture();
-        final bytes = await File(file.path).readAsBytes();
-        _gemini.sendImage(bytes);
-        try {
-          await File(file.path).delete();
-        } catch (_) {}
-      } catch (_) {
-        // Ignore frame capture failures and keep the session alive.
-      }
+          }
+        }),
+      );
     });
   }
 
-  bool _looksLikeUserSpeech(Uint8List pcmData) {
-    if (pcmData.length < 2) {
-      return false;
-    }
+  Future<void> _stopFrameStream() async {
+    _frameTickTimer?.cancel();
+    _frameTickTimer = null;
+    _frameScheduler.clear();
 
-    var peak = 0;
-    final data = ByteData.sublistView(pcmData);
-    for (var i = 0; i <= pcmData.length - 2; i += 2) {
-      final sample = data.getInt16(i, Endian.little).abs();
-      if (sample > peak) {
-        peak = sample;
-      }
+    final controller = _camCtrl;
+    if (_isStreamingFrames && controller != null) {
+      _isStreamingFrames = false;
+      try {
+        await controller.stopImageStream();
+      } catch (_) {}
     }
-
-    return peak > 5000;
   }
 
   void _stopSession({bool updateUi = true}) {
-    _frameTickTimer?.cancel();
-    _frameTickTimer = null;
-    _fallbackFrameTimer?.cancel();
-    _fallbackFrameTimer = null;
-    _frameScheduler.clear();
+    _scanTimer?.cancel();
+    _scanTimer = null;
+    _awaitingSceneSummary = false;
+    _summaryBuffer.clear();
+    unawaited(_stopFrameStream());
     _audio.stopRecording();
     _audio.clearPlayback();
     _gemini.disconnect();
     _cancelSubscriptions();
 
-    final controller = _camCtrl;
-    if (_isStreamingFrames && controller != null) {
-      _isStreamingFrames = false;
-      unawaited(controller.stopImageStream());
-    }
-
     if (updateUi && mounted) {
       setState(() {
         _isActive = false;
         _status = 'Tap to start';
-        _partialTranscript = '';
       });
     } else {
       _isActive = false;
-      _partialTranscript = '';
     }
   }
 
@@ -309,23 +354,97 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _stateSub?.cancel();
   }
 
+  Future<void> _setZoomLevel(double value) async {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    final clamped = value.clamp(_minZoom, _maxZoom);
+    await controller.setZoomLevel(clamped);
+    if (mounted) {
+      setState(() {
+        _zoomLevel = clamped;
+      });
+    }
+  }
+
+  Widget _buildCameraPreview() {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final previewSize = controller.value.previewSize;
+    if (previewSize == null) {
+      return CameraPreview(controller);
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return GestureDetector(
+          onScaleStart: (_) => _baseScale = _zoomLevel,
+          onScaleUpdate: (details) {
+            _setZoomLevel(_baseScale * details.scale);
+          },
+          child: ClipRect(
+            child: FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: previewSize.height,
+                height: previewSize.width,
+                child: CameraPreview(controller),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDebugPanel() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black.withAlpha(170),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: DefaultTextStyle(
+        style: const TextStyle(color: Colors.white70, fontSize: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('ready=${_gemini.isReady} active=$_isActive'),
+            Text('apiKeyPresent=${geminiApiKey.trim().isNotEmpty}'),
+            Text('audioSent=$_audioChunksSent audioReceived=$_audioChunksReceived'),
+            Text('framesSent=$_framesSent stream=$_isStreamingFrames'),
+            Text('zoom=${_zoomLevel.toStringAsFixed(2)}x'),
+            if (_sceneSummary.isNotEmpty) Text('scene=$_sceneSummary'),
+            if (_audio.lastPlaybackError != null)
+              Text('playback=${_audio.lastPlaybackError}'),
+            if (_gemini.lastCloseCode != null || _gemini.lastCloseReason != null)
+              Text(
+                'socket=${_gemini.lastCloseCode ?? '-'} '
+                '${_gemini.lastCloseReason ?? ''}',
+              ),
+            if (_lastTranscript.isNotEmpty) Text('text=$_lastTranscript'),
+            if (_lastError.isNotEmpty) Text('error=$_lastError'),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final cameraReady = _camCtrl != null && _camCtrl!.value.isInitialized;
-    final transcriptLines = [
-      if (_partialTranscript.trim().isNotEmpty) _partialTranscript.trim(),
-      ..._transcriptHistory,
-    ];
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (cameraReady)
-            CameraPreview(_camCtrl!)
-          else
-            const Center(child: CircularProgressIndicator()),
+          _buildCameraPreview(),
           Positioned(
             top: 0,
             left: 0,
@@ -334,18 +453,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Padding(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'AEyes',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ],
+                child: const Text(
+                  'AEyes',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ),
@@ -361,93 +475,61 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   end: Alignment.bottomCenter,
                   colors: [
                     Colors.transparent,
-                    Colors.black.withAlpha(200),
+                    Colors.black.withAlpha(220),
                   ],
                 ),
               ),
-              padding: const EdgeInsets.fromLTRB(24, 60, 24, 48),
+              padding: const EdgeInsets.fromLTRB(20, 60, 20, 32),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (transcriptLines.isNotEmpty)
-                    Container(
-                      width: double.infinity,
-                      margin: const EdgeInsets.only(bottom: 20),
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withAlpha(170),
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: transcriptLines
-                            .map(
-                              (line) => Padding(
-                                padding: const EdgeInsets.only(bottom: 8),
-                                child: Text(
-                                  line,
-                                  style: TextStyle(
-                                    color: line == _partialTranscript.trim()
-                                        ? Colors.white
-                                        : Colors.white70,
-                                    fontSize: 14,
-                                    fontWeight: line == _partialTranscript.trim()
-                                        ? FontWeight.w600
-                                        : FontWeight.w400,
-                                  ),
-                                ),
-                              ),
-                            )
-                            .toList(),
-                      ),
+                  _buildDebugPanel(),
+                  const SizedBox(height: 16),
+                  Text(
+                    _status,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w500,
                     ),
-                  Semantics(
-                    liveRegion: true,
-                    child: Text(
-                      _status,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w500,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
+                    textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 24),
-                  Semantics(
-                    label: _isActive
-                        ? 'Stop AEyes assistant'
-                        : 'Start AEyes assistant',
-                    button: true,
-                    child: GestureDetector(
-                      onTap: _toggle,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 300),
-                        width: 80,
-                        height: 80,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _isActive
-                              ? Colors.red.shade600
-                              : Colors.green.shade600,
-                          boxShadow: _isActive
-                              ? [
-                                  BoxShadow(
-                                    color: Colors.red.withAlpha(100),
-                                    blurRadius: 20,
-                                    spreadRadius: 5,
-                                  )
-                                ]
-                              : null,
+                  const SizedBox(height: 16),
+                  if (_maxZoom > _minZoom)
+                    Column(
+                      children: [
+                        Slider(
+                          value: _zoomLevel.clamp(_minZoom, _maxZoom),
+                          min: _minZoom,
+                          max: _maxZoom,
+                          divisions: ((_maxZoom - _minZoom) * 10)
+                              .clamp(1, 100)
+                              .round(),
+                          onChanged: (value) => _setZoomLevel(value),
                         ),
-                        child: Icon(
-                          _isActive
-                              ? Icons.stop_rounded
-                              : Icons.visibility,
-                          color: Colors.white,
-                          size: 40,
+                        Text(
+                          'Zoom ${_zoomLevel.toStringAsFixed(1)}x',
+                          style: const TextStyle(color: Colors.white70),
                         ),
+                        const SizedBox(height: 12),
+                      ],
+                    ),
+                  GestureDetector(
+                    onTap: _toggle,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      width: 80,
+                      height: 80,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _isActive
+                            ? Colors.red.shade600
+                            : Colors.green.shade600,
+                      ),
+                      child: Icon(
+                        _isActive ? Icons.stop_rounded : Icons.visibility,
+                        color: Colors.white,
+                        size: 40,
                       ),
                     ),
                   ),

@@ -15,9 +15,6 @@ class FrameSendScheduler<T> {
   bool _isBusy = false;
   DateTime? _lastDispatchAt;
 
-  bool get hasPendingFrame => _latest != null;
-  bool get isBusy => _isBusy;
-
   void push(T value) {
     _latest = value;
   }
@@ -66,7 +63,8 @@ class RawCameraFrame {
       width: image.width,
       height: image.height,
       formatGroup: image.format.group.name,
-      planeBytes: image.planes.map((plane) => Uint8List.fromList(plane.bytes)).toList(),
+      planeBytes:
+          image.planes.map((plane) => Uint8List.fromList(plane.bytes)).toList(),
       bytesPerRow: image.planes.map((plane) => plane.bytesPerRow).toList(),
       bytesPerPixel: image.planes.map((plane) => plane.bytesPerPixel).toList(),
     );
@@ -95,7 +93,7 @@ class EncodeFrameRequest {
 Future<Uint8List?> encodeCameraImageToJpeg(
   CameraImage image, {
   int maxWidth = 640,
-  int quality = 70,
+  int quality = 72,
 }) {
   final request = EncodeFrameRequest(
     frame: RawCameraFrame.fromCameraImage(image),
@@ -116,8 +114,8 @@ Uint8List? _encodeFrameToJpeg(EncodeFrameRequest request) {
       : 1.0;
   final targetWidth = (frame.width * scale).round().clamp(1, frame.width);
   final targetHeight = (frame.height * scale).round().clamp(1, frame.height);
-  final image = img.Image(width: targetWidth, height: targetHeight);
 
+  final image = img.Image(width: targetWidth, height: targetHeight);
   for (var y = 0; y < targetHeight; y++) {
     final sourceY = (y * frame.height / targetHeight).floor();
     for (var x = 0; x < targetWidth; x++) {
@@ -148,8 +146,7 @@ Uint8List? _encodeFrameToJpeg(EncodeFrameRequest request) {
     final bytes = frame.planeBytes.first;
     final frameSize = frame.width * frame.height;
     final yValue = bytes[y * frame.width + x];
-    final chromaIndex =
-        frameSize + (y ~/ 2) * frame.width + (x & ~1);
+    final chromaIndex = frameSize + (y ~/ 2) * frame.width + (x & ~1);
     final v = bytes[chromaIndex];
     final u = bytes[chromaIndex + 1];
     return _yuvToRgb(yValue, u, v);
@@ -167,17 +164,13 @@ Uint8List? _encodeFrameToJpeg(EncodeFrameRequest request) {
   final uPlane = frame.planeBytes[1];
   final vPlane = frame.planeBytes[2];
 
-  final yRowStride = frame.bytesPerRow[0];
-  final uRowStride = frame.bytesPerRow[1];
-  final vRowStride = frame.bytesPerRow[2];
-  final uPixelStride = frame.bytesPerPixel[1] ?? 1;
-  final vPixelStride = frame.bytesPerPixel[2] ?? 1;
-
-  final yValue = yPlane[y * yRowStride + x];
+  final yValue = yPlane[y * frame.bytesPerRow[0] + x];
   final uvX = x ~/ 2;
   final uvY = y ~/ 2;
-  final uValue = uPlane[uvY * uRowStride + uvX * uPixelStride];
-  final vValue = vPlane[uvY * vRowStride + uvX * vPixelStride];
+  final uValue = uPlane[
+      uvY * frame.bytesPerRow[1] + uvX * (frame.bytesPerPixel[1] ?? 1)];
+  final vValue = vPlane[
+      uvY * frame.bytesPerRow[2] + uvX * (frame.bytesPerPixel[2] ?? 1)];
 
   return _yuvToRgb(yValue, uValue, vValue);
 }
@@ -186,10 +179,7 @@ Uint8List? _encodeFrameToJpeg(EncodeFrameRequest request) {
   final bytes = frame.planeBytes.first;
   final rowStride = frame.bytesPerRow.first;
   final index = y * rowStride + x * 4;
-  final b = bytes[index];
-  final g = bytes[index + 1];
-  final r = bytes[index + 2];
-  return (r, g, b);
+  return (bytes[index + 2], bytes[index + 1], bytes[index]);
 }
 
 (int, int, int) _yuvToRgb(int y, int u, int v) {
@@ -198,8 +188,8 @@ Uint8List? _encodeFrameToJpeg(EncodeFrameRequest request) {
   final vValue = v - 128;
 
   final r = ((298 * yValue + 409 * vValue + 128) >> 8).clamp(0, 255);
-  final g = ((298 * yValue - 100 * uValue - 208 * vValue + 128) >> 8)
-      .clamp(0, 255);
+  final g =
+      ((298 * yValue - 100 * uValue - 208 * vValue + 128) >> 8).clamp(0, 255);
   final b = ((298 * yValue + 516 * uValue + 128) >> 8).clamp(0, 255);
   return (r, g, b);
 }

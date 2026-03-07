@@ -39,6 +39,7 @@ dependencies:
   audioplayers: ^6.1.0
   image: ^4.5.4
   flutter_dotenv: ^6.0.0
+  flutter_sound: ^9.28.0
 
 dev_dependencies:
   flutter_test:
