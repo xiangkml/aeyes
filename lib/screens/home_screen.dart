@@ -1,12 +1,13 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../config.dart';
 import '../services/audio_service.dart';
+import '../services/camera_frame_service.dart';
 import '../services/gemini_live_service.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -17,15 +18,34 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  static const _frameCadence = Duration(milliseconds: 450);
+  static const _scanDuration = Duration(seconds: 8);
+
   final GeminiLiveService _gemini = GeminiLiveService();
   final AudioService _audio = AudioService();
+  final FrameSendScheduler<CameraImage> _frameScheduler =
+      FrameSendScheduler(minInterval: _frameCadence);
 
   CameraController? _camCtrl;
-  Timer? _frameTimer;
+  Timer? _frameTickTimer;
+  Timer? _scanTimer;
 
   bool _isActive = false;
-  bool _isCapturing = false;
+  bool _isStreamingFrames = false;
   String _status = 'Tap to start';
+  String _lastTranscript = '';
+  String _lastError = '';
+  String _sceneSummary = '';
+  int _audioChunksSent = 0;
+  int _framesSent = 0;
+  int _audioChunksReceived = 0;
+  double _minZoom = 1;
+  double _maxZoom = 1;
+  double _zoomLevel = 1;
+  double _baseScale = 1;
+  bool _scanStarted = false;
+  bool _awaitingSceneSummary = false;
+  final StringBuffer _summaryBuffer = StringBuffer();
 
   StreamSubscription? _audioSub;
   StreamSubscription? _textSub;
@@ -42,7 +62,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _stopSession();
+    _stopSession(updateUi: false);
     _camCtrl?.dispose();
     _gemini.dispose();
     _audio.dispose();
@@ -56,11 +76,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // ── Camera ─────────────────────────────────────────────────────────
-
   Future<void> _initCamera() async {
     final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
+    if (cameras.isEmpty) {
+      return;
+    }
 
     final camera = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
@@ -71,25 +91,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
+          ? ImageFormatGroup.bgra8888
+          : ImageFormatGroup.yuv420,
     );
 
     try {
       await _camCtrl!.initialize();
-      if (mounted) setState(() {});
-    } catch (_) {
-      setState(() => _status = 'Camera not available');
+      _minZoom = await _camCtrl!.getMinZoomLevel();
+      _maxZoom = await _camCtrl!.getMaxZoomLevel();
+      _zoomLevel = _minZoom;
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _status = 'Camera not available';
+          _lastError = '$error';
+        });
+      }
     }
   }
-
-  // ── Permissions ────────────────────────────────────────────────────
 
   Future<bool> _requestPermissions() async {
     final camera = await Permission.camera.request();
     final mic = await Permission.microphone.request();
     return camera.isGranted && mic.isGranted;
   }
-
-  // ── Session control ────────────────────────────────────────────────
 
   Future<void> _toggle() async {
     if (_isActive) {
@@ -101,97 +130,220 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _startSession() async {
     if (!await _requestPermissions()) {
-      setState(() => _status = 'Permissions denied');
+      if (mounted) {
+        setState(() {
+          _status = 'Permissions denied';
+          _lastError = 'Camera or microphone permission denied';
+        });
+      }
       return;
     }
 
-    setState(() {
-      _status = 'Connecting...';
-      _isActive = true;
-    });
+    if (mounted) {
+      setState(() {
+        _status = 'Connecting...';
+        _isActive = true;
+        _lastError = '';
+        _lastTranscript = '';
+        _sceneSummary = '';
+        _audioChunksSent = 0;
+        _framesSent = 0;
+        _audioChunksReceived = 0;
+        _scanStarted = false;
+        _awaitingSceneSummary = false;
+      });
+    }
 
     _cancelSubscriptions();
+    _frameScheduler.clear();
 
-    _stateSub = _gemini.stateStream.listen((s) {
-      if (!mounted) return;
+    _stateSub = _gemini.stateStream.listen((state) {
+      if (!mounted) {
+        return;
+      }
       setState(() {
-        switch (s) {
+        switch (state) {
           case GeminiConnectionState.connecting:
             _status = 'Connecting...';
+            break;
           case GeminiConnectionState.ready:
             _status = 'Listening...';
+            break;
           case GeminiConnectionState.error:
             _status = 'Connection error';
             _isActive = false;
+            _lastError = _gemini.lastCloseReason ?? 'Gemini stream error';
+            break;
           case GeminiConnectionState.disconnected:
             _status = 'Disconnected';
             _isActive = false;
+            break;
         }
       });
     });
 
-    _audioSub = _gemini.audioResponseStream.listen(_audio.addAudioChunk);
+    _audioSub = _gemini.audioResponseStream.listen((chunk) {
+      _audio.addAudioChunk(chunk);
+      if (mounted) {
+        setState(() {
+          _audioChunksReceived++;
+        });
+      }
+    });
 
     _turnSub = _gemini.turnCompleteStream.listen((_) {
       _audio.onTurnComplete();
+      _handleTurnComplete();
     });
 
-    _textSub = _gemini.textResponseStream.listen((t) {
-      debugPrint('Gemini: $t');
+    _textSub = _gemini.textResponseStream.listen((text) {
+      if (!mounted || text.isEmpty) {
+        return;
+      }
+      setState(() {
+        _lastTranscript = text;
+      });
+      if (_awaitingSceneSummary) {
+        _summaryBuffer.write(text);
+      }
+      debugPrint('Gemini: $text');
     });
 
     try {
       await _gemini.connect(geminiApiKey);
-
       await _audio.startRecording((data) {
         _gemini.sendAudio(data);
+        if (mounted) {
+          setState(() {
+            _audioChunksSent++;
+          });
+        }
       });
-
-      _startFrameCapture();
-    } catch (e) {
+      await _startFrameStream();
+      _startSceneScan();
+    } catch (error) {
       if (mounted) {
         setState(() {
           _status = 'Failed to connect';
           _isActive = false;
+          _lastError = '$error';
         });
       }
+      await _stopFrameStream();
     }
   }
 
-  void _startFrameCapture() {
-    _frameTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      if (!_isActive || _isCapturing) return;
-      if (_camCtrl == null || !_camCtrl!.value.isInitialized) return;
+  void _startSceneScan() {
+    if (_scanStarted || !_isActive || !_gemini.isReady) {
+      return;
+    }
+    _scanStarted = true;
+    _gemini.sendText(_gemini.startupScanPrompt);
+    if (mounted) {
+      setState(() {
+        _status = 'Scan surroundings slowly...';
+      });
+    }
+    _scanTimer?.cancel();
+    _scanTimer = Timer(_scanDuration, _requestSceneSummary);
+  }
 
-      _isCapturing = true;
-      try {
-        final xFile = await _camCtrl!.takePicture();
-        final bytes = await File(xFile.path).readAsBytes();
-        _gemini.sendImage(bytes);
-        try {
-          await File(xFile.path).delete();
-        } catch (_) {}
-      } catch (_) {
-        // skip frame
-      } finally {
-        _isCapturing = false;
+  void _requestSceneSummary() {
+    if (!_isActive || !_gemini.isReady) {
+      return;
+    }
+    _summaryBuffer.clear();
+    _awaitingSceneSummary = true;
+    _gemini.sendText(_gemini.sceneSummaryPrompt);
+    if (mounted) {
+      setState(() {
+        _status = 'Building scene summary...';
+      });
+    }
+  }
+
+  void _handleTurnComplete() {
+    if (!_awaitingSceneSummary) {
+      return;
+    }
+    _awaitingSceneSummary = false;
+    final summary = _summaryBuffer.toString().trim();
+    _summaryBuffer.clear();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      if (summary.isNotEmpty) {
+        _sceneSummary = summary;
       }
+      _status = 'Listening...';
     });
   }
 
-  void _stopSession() {
-    _frameTimer?.cancel();
-    _frameTimer = null;
+  Future<void> _startFrameStream() async {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    await _stopFrameStream();
+    await controller.startImageStream((image) {
+      _frameScheduler.push(image);
+    });
+    _isStreamingFrames = true;
+
+    _frameTickTimer = Timer.periodic(_frameCadence, (_) {
+      unawaited(
+        _frameScheduler.dispatchLatest((image) async {
+          if (!_isActive || !_gemini.isReady) {
+            return;
+          }
+          final jpegBytes = await encodeCameraImageToJpeg(image);
+          if (jpegBytes != null && _isActive) {
+            _gemini.sendImage(jpegBytes);
+            if (mounted) {
+              setState(() {
+                _framesSent++;
+              });
+            }
+          }
+        }),
+      );
+    });
+  }
+
+  Future<void> _stopFrameStream() async {
+    _frameTickTimer?.cancel();
+    _frameTickTimer = null;
+    _frameScheduler.clear();
+
+    final controller = _camCtrl;
+    if (_isStreamingFrames && controller != null) {
+      _isStreamingFrames = false;
+      try {
+        await controller.stopImageStream();
+      } catch (_) {}
+    }
+  }
+
+  void _stopSession({bool updateUi = true}) {
+    _scanTimer?.cancel();
+    _scanTimer = null;
+    _awaitingSceneSummary = false;
+    _summaryBuffer.clear();
+    unawaited(_stopFrameStream());
     _audio.stopRecording();
     _audio.clearPlayback();
     _gemini.disconnect();
     _cancelSubscriptions();
 
-    if (mounted) {
+    if (updateUi && mounted) {
       setState(() {
         _isActive = false;
         _status = 'Tap to start';
       });
+    } else {
+      _isActive = false;
     }
   }
 
@@ -202,25 +354,97 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _stateSub?.cancel();
   }
 
-  // ── UI ─────────────────────────────────────────────────────────────
+  Future<void> _setZoomLevel(double value) async {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    final clamped = value.clamp(_minZoom, _maxZoom);
+    await controller.setZoomLevel(clamped);
+    if (mounted) {
+      setState(() {
+        _zoomLevel = clamped;
+      });
+    }
+  }
+
+  Widget _buildCameraPreview() {
+    final controller = _camCtrl;
+    if (controller == null || !controller.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final previewSize = controller.value.previewSize;
+    if (previewSize == null) {
+      return CameraPreview(controller);
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return GestureDetector(
+          onScaleStart: (_) => _baseScale = _zoomLevel,
+          onScaleUpdate: (details) {
+            _setZoomLevel(_baseScale * details.scale);
+          },
+          child: ClipRect(
+            child: FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: previewSize.height,
+                height: previewSize.width,
+                child: CameraPreview(controller),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDebugPanel() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.black.withAlpha(170),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: DefaultTextStyle(
+        style: const TextStyle(color: Colors.white70, fontSize: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('ready=${_gemini.isReady} active=$_isActive'),
+            Text('apiKeyPresent=${geminiApiKey.trim().isNotEmpty}'),
+            Text('audioSent=$_audioChunksSent audioReceived=$_audioChunksReceived'),
+            Text('framesSent=$_framesSent stream=$_isStreamingFrames'),
+            Text('zoom=${_zoomLevel.toStringAsFixed(2)}x'),
+            if (_sceneSummary.isNotEmpty) Text('scene=$_sceneSummary'),
+            if (_audio.lastPlaybackError != null)
+              Text('playback=${_audio.lastPlaybackError}'),
+            if (_gemini.lastCloseCode != null || _gemini.lastCloseReason != null)
+              Text(
+                'socket=${_gemini.lastCloseCode ?? '-'} '
+                '${_gemini.lastCloseReason ?? ''}',
+              ),
+            if (_lastTranscript.isNotEmpty) Text('text=$_lastTranscript'),
+            if (_lastError.isNotEmpty) Text('error=$_lastError'),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final cameraReady =
-        _camCtrl != null && _camCtrl!.value.isInitialized;
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Camera preview
-          if (cameraReady)
-            CameraPreview(_camCtrl!)
-          else
-            const Center(child: CircularProgressIndicator()),
-
-          // Top bar
+          _buildCameraPreview(),
           Positioned(
             top: 0,
             left: 0,
@@ -229,25 +453,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Padding(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'AEyes',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-
-                  ],
+                child: const Text(
+                  'AEyes',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
             ),
           ),
-
-          // Bottom controls
           Positioned(
             bottom: 0,
             left: 0,
@@ -259,63 +475,61 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   end: Alignment.bottomCenter,
                   colors: [
                     Colors.transparent,
-                    Colors.black.withAlpha(200),
+                    Colors.black.withAlpha(220),
                   ],
                 ),
               ),
-              padding: const EdgeInsets.fromLTRB(24, 60, 24, 48),
+              padding: const EdgeInsets.fromLTRB(20, 60, 20, 32),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Status
-                  Semantics(
-                    liveRegion: true,
-                    child: Text(
-                      _status,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w500,
-                      ),
-                      textAlign: TextAlign.center,
+                  _buildDebugPanel(),
+                  const SizedBox(height: 16),
+                  Text(
+                    _status,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w500,
                     ),
+                    textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 24),
-
-                  // Start / Stop button
-                  Semantics(
-                    label: _isActive
-                        ? 'Stop AEyes assistant'
-                        : 'Start AEyes assistant',
-                    button: true,
-                    child: GestureDetector(
-                      onTap: _toggle,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 300),
-                        width: 80,
-                        height: 80,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _isActive
-                              ? Colors.red.shade600
-                              : Colors.green.shade600,
-                          boxShadow: _isActive
-                              ? [
-                                  BoxShadow(
-                                    color: Colors.red.withAlpha(100),
-                                    blurRadius: 20,
-                                    spreadRadius: 5,
-                                  )
-                                ]
-                              : null,
+                  const SizedBox(height: 16),
+                  if (_maxZoom > _minZoom)
+                    Column(
+                      children: [
+                        Slider(
+                          value: _zoomLevel.clamp(_minZoom, _maxZoom),
+                          min: _minZoom,
+                          max: _maxZoom,
+                          divisions: ((_maxZoom - _minZoom) * 10)
+                              .clamp(1, 100)
+                              .round(),
+                          onChanged: (value) => _setZoomLevel(value),
                         ),
-                        child: Icon(
-                          _isActive
-                              ? Icons.stop_rounded
-                              : Icons.visibility,
-                          color: Colors.white,
-                          size: 40,
+                        Text(
+                          'Zoom ${_zoomLevel.toStringAsFixed(1)}x',
+                          style: const TextStyle(color: Colors.white70),
                         ),
+                        const SizedBox(height: 12),
+                      ],
+                    ),
+                  GestureDetector(
+                    onTap: _toggle,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 300),
+                      width: 80,
+                      height: 80,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _isActive
+                            ? Colors.red.shade600
+                            : Colors.green.shade600,
+                      ),
+                      child: Icon(
+                        _isActive ? Icons.stop_rounded : Icons.visibility,
+                        color: Colors.white,
+                        size: 40,
                       ),
                     ),
                   ),
