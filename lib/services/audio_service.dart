@@ -9,6 +9,7 @@ class AudioService {
   static const int sendSampleRate = 16000;
   static const int receiveSampleRate = 24000;
   static const int numChannels = 1;
+  static const double userSpeechThresholdDb = -18.0;
 
   final AudioRecorder _recorder = AudioRecorder();
   final FlutterSoundPlayer _player = FlutterSoundPlayer();
@@ -24,6 +25,19 @@ class AudioService {
   String? _lastPlaybackError;
 
   String? get lastPlaybackError => _lastPlaybackError;
+
+  Future<double?> getCurrentAmplitudeDb() async {
+    if (!_isRecording) {
+      return null;
+    }
+    try {
+      final amplitude = await _recorder.getAmplitude();
+      return amplitude.current;
+    } catch (error) {
+      _lastPlaybackError = 'Amplitude read failed: $error';
+      return null;
+    }
+  }
 
   AudioService() {
     unawaited(_initPlayer());

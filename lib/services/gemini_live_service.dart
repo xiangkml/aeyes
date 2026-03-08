@@ -36,18 +36,9 @@ class GeminiLiveService {
       'Keep responses brief, concrete, and action-oriented unless the user asks for more detail. '
       'Do not rely on the user reading the screen.';
 
-  static const String _startupScanPrompt =
-      'Start by greeting the user briefly in voice. '
-      'Tell them you will first scan the space for safety. '
-      'Ask them to stand still if possible and slowly move the phone in a full sweep from left to right, then slightly down toward the floor, '
-      'then up again, and if safe continue around to complete a slow 360-degree scan. '
-      'Keep the instructions short and clear because the user is blind.';
-
-  static const String _sceneSummaryPrompt =
-      'Based on the live scan you just observed, give a short spoken scene summary focused on safety first. '
-      'Mention immediate hazards such as stairs, drops, floor clutter, sharp or hot objects, low obstacles, blocked paths, and safe open space. '
-      'Then mention the main landmarks or likely search areas in the room. '
-      'Keep it under six sentences and say when you are uncertain.';
+  static const String _startupPrompt =
+      'Start by greeting the user briefly in voice, explain that you can help them find objects, understand their surroundings, and avoid hazards, '
+      'then ask what they want help locating or doing right now.';
 
   final WebSocketChannel Function(Uri uri) _channelFactory;
 
@@ -68,14 +59,16 @@ class GeminiLiveService {
   Stream<String> get textResponseStream => _textResponseController.stream;
   Stream<void> get turnCompleteStream => _turnCompleteController.stream;
   Stream<GeminiConnectionState> get stateStream => _stateController.stream;
-  String get startupScanPrompt => _startupScanPrompt;
-  String get sceneSummaryPrompt => _sceneSummaryPrompt;
+  String get startupPrompt => _startupPrompt;
 
   bool get isReady => _isConnected && _setupComplete;
   int? get lastCloseCode => _lastCloseCode;
   String? get lastCloseReason => _lastCloseReason;
 
-  Future<void> connect(String apiKey) async {
+  Future<void> connect(
+    String apiKey, {
+    String? cloudSessionId,
+  }) async {
     if (_isConnected) {
       await disconnect();
     }
@@ -85,7 +78,7 @@ class GeminiLiveService {
     _stateController.add(GeminiConnectionState.connecting);
 
     try {
-      final uri = Uri.parse('$_wsBaseUrl?key=$apiKey');
+      final uri = _buildConnectionUri(apiKey, cloudSessionId: cloudSessionId);
       _channel = _channelFactory(uri);
       await _channel!.ready;
       _isConnected = true;
@@ -130,6 +123,18 @@ class GeminiLiveService {
       _setupComplete = false;
       rethrow;
     }
+  }
+
+  Uri _buildConnectionUri(String apiKey, {String? cloudSessionId}) {
+    final cloudUri = cloudLiveWebSocketUri;
+    if (cloudUri != null) {
+      final queryParameters = <String, String>{
+        if (cloudSessionId != null && cloudSessionId.isNotEmpty)
+          'session_id': cloudSessionId,
+      };
+      return cloudUri.replace(queryParameters: queryParameters);
+    }
+    return Uri.parse('$_wsBaseUrl?key=$apiKey');
   }
 
   void _sendSetup() {

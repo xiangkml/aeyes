@@ -40,6 +40,7 @@ dependencies:
   image: ^4.5.4
   flutter_dotenv: ^6.0.0
   flutter_sound: ^9.28.0
+  http: ^1.4.0
 
 dev_dependencies:
   flutter_test:
