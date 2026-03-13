@@ -561,10 +561,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final now = DateTime.now();
     final lower = text.toLowerCase();
     final labels = _extractLabels(text);
+    final explicitSaveLabel = _extractExplicitSaveLabel(lower);
     final ownershipLabel = _extractOwnershipLabel(lower);
     final findTargetLabel = _extractFindTargetLabel(lower);
     final inferredLabel = _inferLabelFromText(lower);
-    final primaryLabelRaw = ownershipLabel.isNotEmpty
+    final primaryLabelRaw = explicitSaveLabel.isNotEmpty
+      ? explicitSaveLabel
+      : ownershipLabel.isNotEmpty
       ? ownershipLabel
       : labels.isNotEmpty
         ? labels.first
@@ -612,11 +615,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       lower,
       const [
         'save this object',
+        'save this object as',
         'save this item',
+        'save this item as',
+        'save as',
         'remember this object',
         'i will save this',
       ],
     );
+    if (explicitSaveLabel.isNotEmpty) {
+      manualTrigger = true;
+    }
     final ownershipTrigger = ownershipLabel.isNotEmpty;
 
     int repeatCount = 0;
@@ -947,6 +956,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final object = _normalizeLabel(match.group(1) ?? '');
       if (object.isNotEmpty) {
         return _canonicalObjectLabel(object);
+      }
+    }
+    return '';
+  }
+
+  String _extractExplicitSaveLabel(String text) {
+    final patterns = <RegExp>[
+      RegExp(r"\bsave\s+this\s+object\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+this\s+item\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+as\s+([a-z0-9' ]{2,50})"),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final label = _canonicalObjectLabel(match.group(1) ?? '');
+      if (label.isNotEmpty) {
+        return label;
       }
     }
     return '';
