@@ -216,6 +216,55 @@ class CloudAgentService {
         .toList(growable: false);
   }
 
+  Future<List<Map<String, dynamic>>> searchMemories({
+    required String label,
+    List<double>? embedding,
+    int topK = 3,
+    double minScore = 0.35,
+  }) async {
+    if (!isEnabled || label.trim().isEmpty) {
+      return const [];
+    }
+
+    final response = await _client.post(
+      Uri.parse('${cloudBackendBaseUrl.trim()}/v1/memory/search'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'userLabel': label,
+        'aiLabel': label,
+        'embedding': embedding,
+        'topK': topK,
+        'minScore': minScore,
+      }),
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError('Cloud memory search failed: ${response.body}');
+    }
+
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    final rawItems = body['items'];
+    if (rawItems is! List) {
+      return const [];
+    }
+
+    return rawItems
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList(growable: false);
+  }
+
+  Future<Uint8List?> downloadImageBytes(String imageUrl) async {
+    if (imageUrl.trim().isEmpty) {
+      return null;
+    }
+    final response = await _client.get(Uri.parse(imageUrl));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return null;
+    }
+    return response.bodyBytes;
+  }
+
   void dispose() {
     _client.close();
   }

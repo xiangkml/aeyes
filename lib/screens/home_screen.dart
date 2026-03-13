@@ -575,19 +575,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ? findTargetLabel
           : inferredLabel;
     final primaryLabel = _canonicalObjectLabel(primaryLabelRaw);
+    final primaryObjectName = _recognitionObjectName(primaryLabel);
     final aiLabels = labels
-      .map(_canonicalObjectLabel)
+      .map(_canonicalObjectNameLabel)
       .where((item) => item.isNotEmpty)
       .toSet()
       .toList(growable: false);
     final aiLabelsForUpload = aiLabels.isNotEmpty
         ? aiLabels
         : [
-            if (primaryLabel.isNotEmpty) primaryLabel,
-            if (inferredLabel.isNotEmpty) _canonicalObjectLabel(inferredLabel),
-            if (findTargetLabel.isNotEmpty) _canonicalObjectLabel(findTargetLabel),
+            if (primaryObjectName.isNotEmpty) primaryObjectName,
+            if (inferredLabel.isNotEmpty)
+              _canonicalObjectNameLabel(inferredLabel),
+            if (findTargetLabel.isNotEmpty)
+              _canonicalObjectNameLabel(findTargetLabel),
           ].where((item) => item.isNotEmpty).toSet().toList(growable: false);
-    final hasLabel = primaryLabel.isNotEmpty || aiLabels.isNotEmpty;
+    final hasLabel = primaryLabel.isNotEmpty || aiLabelsForUpload.isNotEmpty;
 
     bool intentTrigger = _containsAny(
       lower,
@@ -679,7 +682,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final confidence = confidenceTrigger ? 0.88 : (repeatTrigger ? 0.72 : 0.61);
-    final embedText = ([primaryLabel, ...aiLabelsForUpload].where((item) => item.isNotEmpty).join(' ')).trim();
+    final embedText = ([
+      primaryObjectName,
+      ...aiLabelsForUpload,
+    ].where((item) => item.isNotEmpty).join(' ')).trim();
     final embedding = _buildLabelEmbedding(embedText);
 
     if (intentTrigger && primaryLabel.isNotEmpty) {
@@ -789,7 +795,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     try {
-      final matches = await _cloud.matchScreenshots(
+      var matches = await _cloud.matchScreenshots(
         sessionId: sessionId,
         userLabel: label,
         aiLabel: label,
@@ -797,6 +803,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         topK: 1,
         minScore: 0.55,
       );
+      if (matches.isEmpty) {
+        matches = await _cloud.searchMemories(
+          label: label,
+          embedding: embedding,
+          topK: 1,
+          minScore: 0.45,
+        );
+      }
       if (matches.isEmpty || !_gemini.isReady || !_isActive) {
         return;
       }
@@ -808,7 +822,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final matchScore = (top['matchScore'] as num?)?.toDouble() ?? 0;
       final hint =
           'Memory hint: previously seen "$topLabel" with similarity score ${matchScore.toStringAsFixed(2)}. '
-          'Use this memory while guiding the user to find the object now.';
+          'Use this memory while guiding the user to find the object now. '
+          'A reference screenshot is being sent.';
+
+      final imageUrl = (top['imageUrl'] as String?) ?? '';
+      final referenceImage = await _cloud.downloadImageBytes(imageUrl);
+      if (referenceImage != null && referenceImage.isNotEmpty) {
+        _gemini.sendImage(referenceImage);
+      }
 
       _gemini.sendText(hint);
       _lastHintLabel = label;
@@ -903,6 +924,46 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return '';
     }
     return withoutArticles;
+  }
+
+  String _canonicalObjectNameLabel(String value) {
+    final contextual = _canonicalObjectLabel(value);
+    if (contextual.isEmpty) {
+      return '';
+    }
+    return _recognitionObjectName(contextual);
+  }
+
+  String _recognitionObjectName(String label) {
+    final text = _normalizeLabel(label)
+        .replaceFirst("user's ", '')
+        .replaceFirst("other person's ", '')
+        .replaceFirst("someone else's ", '');
+
+    final words = text
+        .split(' ')
+        .where((word) => word.isNotEmpty)
+        .where((word) => !const {
+              'this',
+              'that',
+              'it',
+              'is',
+              'are',
+              'near',
+              'at',
+              'on',
+              'in',
+              'to',
+              'of',
+            }.contains(word))
+        .toList(growable: false);
+
+    if (words.isEmpty) {
+      return '';
+    }
+
+    final joined = words.take(3).join(' ');
+    return joined;
   }
 
   String _extractOwnershipLabel(String text) {
