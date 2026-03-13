@@ -114,8 +114,17 @@ def cosine_similarity(left, right):
 
 
 def label_similarity(query_labels, candidate_labels):
-    query = {normalize_label(item) for item in query_labels if item}
-    candidate = {normalize_label(item) for item in candidate_labels if item}
+    def simplify(value: str) -> str:
+        normalized = normalize_label(value)
+        return (
+            normalized.replace("user's ", "")
+            .replace("other person's ", "")
+            .replace("someone else's ", "")
+            .strip()
+        )
+
+    query = {simplify(item) for item in query_labels if item}
+    candidate = {simplify(item) for item in candidate_labels if item}
     query.discard("")
     candidate.discard("")
     if not query or not candidate:
@@ -123,11 +132,21 @@ def label_similarity(query_labels, candidate_labels):
     if query & candidate:
         return 1.0
 
+    best_score = 0.0
     for query_item in query:
         for candidate_item in candidate:
             if query_item in candidate_item or candidate_item in query_item:
-                return 0.7
-    return 0.0
+                best_score = max(best_score, 0.7)
+
+            query_tokens = set(query_item.split())
+            candidate_tokens = set(candidate_item.split())
+            if query_tokens and candidate_tokens:
+                overlap = len(query_tokens & candidate_tokens)
+                if overlap > 0:
+                    token_score = overlap / len(query_tokens | candidate_tokens)
+                    best_score = max(best_score, 0.35 + (0.55 * token_score))
+
+    return best_score
 
 
 async def _read_image_part(part) -> tuple[bytes | None, web.Response | None]:
@@ -260,18 +279,19 @@ async def upload_screenshot(request: web.Request) -> web.Response:
         return web.json_response({"error": "GCS_BUCKET_NAME is not configured"}, status=503)
 
     multipart = await request.multipart()
-    image_part = None
+    image_bytes = None
     fields = {}
 
     async for part in multipart:
         if part.name == "image":
-            image_part = part
+            image_bytes, read_error = await _read_image_part(part)
+            if read_error is not None:
+                return read_error
             continue
         fields[part.name] = await part.text()
 
-    image_bytes, read_error = await _read_image_part(image_part)
-    if read_error is not None:
-        return read_error
+    if image_bytes is None:
+        return web.json_response({"error": "missing image part"}, status=400)
 
     metadata = {}
     if "metadata" in fields and fields["metadata"].strip():
@@ -282,6 +302,11 @@ async def upload_screenshot(request: web.Request) -> web.Response:
 
     user_label = fields.get("userLabel") or metadata.get("userLabel") or ""
     ai_label = fields.get("aiLabel") or metadata.get("aiLabel") or ""
+    if not user_label.strip() and not ai_label.strip():
+        return web.json_response(
+            {"error": "object label is required before screenshot upload"},
+            status=400,
+        )
     trigger_reason = fields.get("triggerReason") or metadata.get("triggerReason") or "unknown"
     confidence = safe_float(fields.get("confidence") or metadata.get("confidence"))
     repeat_count = int(safe_float(fields.get("repeatCount") or metadata.get("repeatCount")) or 0)
