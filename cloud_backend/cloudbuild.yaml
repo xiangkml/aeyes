@@ -2,9 +2,11 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args:
       - build
+      - -f
+      - cloud_backend/Dockerfile
       - -t
       - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/aeyes-cloud-agent:${BUILD_ID}
-      - .
+      - cloud_backend
   - name: gcr.io/cloud-builders/docker
     args:
       - push
