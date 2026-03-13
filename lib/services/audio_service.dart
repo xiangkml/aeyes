@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_sound/flutter_sound.dart';
@@ -9,7 +10,26 @@ class AudioService {
   static const int sendSampleRate = 16000;
   static const int receiveSampleRate = 24000;
   static const int numChannels = 1;
-  static const double userSpeechThresholdDb = -18.0;
+  static const double userSpeechThresholdDb = -12.0;
+  static const double minInputVolumeDb = -35.0;
+
+  /// Computes the RMS volume of a PCM16 audio chunk in decibels.
+  /// Returns negative infinity for silent/empty data.
+  static double calculateVolumeDb(Uint8List pcmData) {
+    if (pcmData.length < 2) return double.negativeInfinity;
+    final samples = pcmData.buffer.asInt16List(
+      pcmData.offsetInBytes,
+      pcmData.lengthInBytes ~/ 2,
+    );
+    double sumSquares = 0;
+    for (final sample in samples) {
+      sumSquares += sample * sample;
+    }
+    final rms = math.sqrt(sumSquares / samples.length);
+    if (rms < 1) return double.negativeInfinity;
+    // Normalize against Int16 max (32767) and convert to dB.
+    return 20 * math.log(rms / 32767) / math.ln10;
+  }
 
   final AudioRecorder _recorder = AudioRecorder();
   final FlutterSoundPlayer _player = FlutterSoundPlayer();
@@ -23,8 +43,15 @@ class AudioService {
   bool _streamStarted = false;
   bool _isFeeding = false;
   String? _lastPlaybackError;
+  DateTime? _lastFeedTime;
 
   String? get lastPlaybackError => _lastPlaybackError;
+
+  /// True when there are audio chunks queued or being fed to the player.
+  bool get hasPendingPlayback => _pendingPlayback.isNotEmpty || _isFeeding;
+
+  /// The time the last audio chunk was written to the player sink.
+  DateTime? get lastFeedTime => _lastFeedTime;
 
   Future<double?> getCurrentAmplitudeDb() async {
     if (!_isRecording) {
@@ -111,6 +138,7 @@ class AudioService {
 
   void clearPlayback() {
     _pendingPlayback.clear();
+    _lastFeedTime = null;
     unawaited(_resetPlaybackStream());
   }
 
@@ -143,6 +171,7 @@ class AudioService {
           break;
         }
         sink.add(chunk);
+        _lastFeedTime = DateTime.now();
       }
       _lastPlaybackError = null;
     } catch (error) {

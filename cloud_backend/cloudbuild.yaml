@@ -17,8 +17,11 @@ steps:
       - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/aeyes-cloud-agent:${BUILD_ID}
       - --region=${_REGION}
       - --allow-unauthenticated
-      - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GEMINI_API_KEY=${_GEMINI_API_KEY}
+      - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GEMINI_API_KEY=${_GEMINI_API_KEY},GCS_BUCKET_NAME=${_GCS_BUCKET_NAME},SIGNED_URL_TTL_HOURS=${_SIGNED_URL_TTL_HOURS},MAX_SCREENSHOT_BYTES=${_MAX_SCREENSHOT_BYTES}
 
 substitutions:
   _REGION: us-central1
   _GEMINI_API_KEY: ""
+  _GCS_BUCKET_NAME: "aeye-489603_cloudbuild"
+  _SIGNED_URL_TTL_HOURS: "24"
+  _MAX_SCREENSHOT_BYTES: "5242880"

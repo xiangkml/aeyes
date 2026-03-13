@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -21,8 +22,12 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _frameCadence = Duration(milliseconds: 450);
   static const _assistantSpeechHold = Duration(milliseconds: 1200);
+  static const _assistantSpeechTimeout = Duration(seconds: 4);
+  static const _playbackCooldown = Duration(milliseconds: 600);
   static const _amplitudePollInterval = Duration(milliseconds: 150);
-  static const _bargeInConfirmationsRequired = 3;
+  static const _bargeInConfirmationsRequired = 5;
+  static const _memoryUploadCooldown = Duration(seconds: 12);
+  static const _repeatLabelThreshold = 3;
 
   final GeminiLiveService _gemini = GeminiLiveService();
   final AudioService _audio = AudioService();
@@ -50,10 +55,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   double _baseScale = 1;
   bool _introSent = false;
   bool _assistantSpeaking = false;
+  bool _turnCompleteReceived = false;
   int _bargeInConfirmations = 0;
   String? _cloudSessionId;
   DateTime? _lastAssistantAudioAt;
+  DateTime? _playbackEndedAt;
   final StringBuffer _turnBuffer = StringBuffer();
+  Uint8List? _latestFrameJpeg;
+  int _latestFrameWidth = 0;
+  int _latestFrameHeight = 0;
+  DateTime? _latestFrameAt;
+  DateTime? _lastMemoryUploadAt;
+  DateTime? _lastMemoryHintAt;
+  String _lastUploadedLabel = '';
+  String _lastHintLabel = '';
+  String _memoryStatus = 'idle';
+  int _savedMemories = 0;
+  final Map<String, int> _labelSeenCount = <String, int>{};
 
   StreamSubscription? _audioSub;
   StreamSubscription? _textSub;
@@ -204,6 +222,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
 
     _turnSub = _gemini.turnCompleteStream.listen((_) {
+      _turnCompleteReceived = true;
       _audio.onTurnComplete();
       unawaited(_syncCloudContext());
     });
@@ -216,6 +235,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _lastTranscript = text;
       });
       _turnBuffer.write(text);
+      unawaited(_evaluateScreenshotTrigger(text));
       debugPrint('Gemini: $text');
     });
 
@@ -249,6 +269,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
       await _audio.startRecording((data) {
         if (_assistantSpeaking) {
+          return;
+        }
+        // Suppress mic input briefly after playback ends to avoid echo.
+        final playbackEndedAt = _playbackEndedAt;
+        if (playbackEndedAt != null &&
+            DateTime.now().difference(playbackEndedAt) < _playbackCooldown) {
           return;
         }
         _gemini.sendAudio(data);
@@ -306,6 +332,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           }
           final jpegBytes = await encodeCameraImageToJpeg(image);
           if (jpegBytes != null && _isActive) {
+            _latestFrameJpeg = jpegBytes;
+            _latestFrameWidth = image.width;
+            _latestFrameHeight = image.height;
+            _latestFrameAt = DateTime.now();
             _gemini.sendImage(jpegBytes);
             if (mounted) {
               setState(() {
@@ -346,10 +376,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final lastAssistantAudioAt = _lastAssistantAudioAt;
     if (_assistantSpeaking &&
-        lastAssistantAudioAt != null &&
-        DateTime.now().difference(lastAssistantAudioAt) > _assistantSpeechHold) {
+        lastAssistantAudioAt != null) {
+      final elapsed = DateTime.now().difference(lastAssistantAudioAt);
+      // Only transition out of speaking when turnComplete has been received
+      // and enough time has passed, OR as a safety fallback after a longer timeout.
+      final canTransition = _turnCompleteReceived
+          ? elapsed > _assistantSpeechHold
+          : elapsed > _assistantSpeechTimeout;
+      if (!canTransition) {
+        return;
+      }
+      // Don't exit speaking state while the player still has buffered audio.
+      if (_audio.hasPendingPlayback) {
+        return;
+      }
+      // Also wait for the player's internal buffer to finish playing.
+      final lastFeed = _audio.lastFeedTime;
+      if (lastFeed != null &&
+          DateTime.now().difference(lastFeed) < _assistantSpeechHold) {
+        return;
+      }
       _assistantSpeaking = false;
+      _turnCompleteReceived = false;
       _bargeInConfirmations = 0;
+      _playbackEndedAt = DateTime.now();
       if (mounted && _gemini.isReady) {
         setState(() {
           _status = 'Listening...';
@@ -379,6 +429,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _bargeInConfirmations = 0;
     _assistantSpeaking = false;
+    _turnCompleteReceived = false;
+    _playbackEndedAt = DateTime.now();
     _audio.clearPlayback();
     if (mounted) {
       setState(() {
@@ -390,6 +442,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _markAssistantSpeaking() {
     _lastAssistantAudioAt = DateTime.now();
     _bargeInConfirmations = 0;
+    _turnCompleteReceived = false;
     if (_assistantSpeaking) {
       return;
     }
@@ -408,8 +461,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _amplitudeTimer?.cancel();
     _amplitudeTimer = null;
     _assistantSpeaking = false;
+    _turnCompleteReceived = false;
     _bargeInConfirmations = 0;
     _lastAssistantAudioAt = null;
+    _playbackEndedAt = null;
+    _latestFrameJpeg = null;
+    _latestFrameAt = null;
+    _latestFrameWidth = 0;
+    _latestFrameHeight = 0;
+    _labelSeenCount.clear();
+    _lastUploadedLabel = '';
+    _lastMemoryUploadAt = null;
+    _lastMemoryHintAt = null;
+    _lastHintLabel = '';
+    _memoryStatus = _cloud.isEnabled ? 'idle' : 'disabled';
     unawaited(_stopFrameStream());
     _audio.stopRecording();
     _audio.clearPlayback();
@@ -452,7 +517,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         sessionId: sessionId,
         mode: 'live_assistance',
         sceneSummary: _sceneSummary,
-        memoryContext: _lastTranscript,
+        memoryContext: _savedMemories == 0
+            ? _lastTranscript
+            : '${_lastTranscript.trim()} | visualMemoryCount=$_savedMemories',
         transcript: transcript,
         currentGoal: null,
         arCapabilities: const {
@@ -473,6 +540,269 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         });
       }
     }
+  }
+
+  Future<void> _evaluateScreenshotTrigger(String text) async {
+    final sessionId = _cloudSessionId;
+    final latestFrame = _latestFrameJpeg;
+    if (!_isActive || sessionId == null || latestFrame == null || !_cloud.isEnabled) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final lower = text.toLowerCase();
+    final labels = _extractLabels(text);
+    final primaryLabel = labels.isNotEmpty ? labels.first : _inferLabelFromText(lower);
+
+    bool intentTrigger = _containsAny(
+      lower,
+      const [
+        'find',
+        'look for',
+        'recognize',
+        'identify',
+        'searching for',
+      ],
+    );
+    bool confidenceTrigger = _containsAny(
+      lower,
+      const [
+        'i found',
+        'i can see your',
+        'that is your',
+        'this is your',
+        'looks like your',
+      ],
+    );
+    bool manualTrigger = _containsAny(
+      lower,
+      const [
+        'save this object',
+        'save this item',
+        'remember this object',
+        'i will save this',
+      ],
+    );
+
+    int repeatCount = 0;
+    bool repeatTrigger = false;
+    if (primaryLabel.isNotEmpty) {
+      repeatCount = (_labelSeenCount[primaryLabel] ?? 0) + 1;
+      _labelSeenCount[primaryLabel] = repeatCount;
+      repeatTrigger = repeatCount >= _repeatLabelThreshold;
+    }
+
+    if (!intentTrigger && !confidenceTrigger && !repeatTrigger && !manualTrigger) {
+      return;
+    }
+
+    final lastUploadAt = _lastMemoryUploadAt;
+    if (lastUploadAt != null && now.difference(lastUploadAt) < _memoryUploadCooldown) {
+      return;
+    }
+
+    if (primaryLabel.isNotEmpty && primaryLabel == _lastUploadedLabel) {
+      return;
+    }
+
+    final confidence = confidenceTrigger ? 0.88 : (repeatTrigger ? 0.72 : 0.61);
+    final embedText = ([primaryLabel, ...labels].where((item) => item.isNotEmpty).join(' ')).trim();
+    final embedding = _buildLabelEmbedding(embedText);
+
+    if (intentTrigger && primaryLabel.isNotEmpty) {
+      unawaited(
+        _maybeInjectMemoryHint(
+          sessionId: sessionId,
+          label: primaryLabel,
+          embedding: embedding,
+        ),
+      );
+    }
+
+    await _uploadObjectMemorySnapshot(
+      sessionId: sessionId,
+      frame: latestFrame,
+      userLabel: primaryLabel,
+      aiLabel: labels.join(', '),
+      triggerReason: manualTrigger
+          ? 'manual'
+          : confidenceTrigger
+              ? 'confidence'
+              : repeatTrigger
+                  ? 'repeat'
+                  : 'intent',
+      confidence: confidence,
+      repeatCount: repeatCount,
+      intentTrigger: intentTrigger,
+      confidenceTrigger: confidenceTrigger,
+      repeatTrigger: repeatTrigger,
+      manualTrigger: manualTrigger,
+      embedding: embedding,
+    );
+  }
+
+  Future<void> _uploadObjectMemorySnapshot({
+    required String sessionId,
+    required Uint8List frame,
+    required String userLabel,
+    required String aiLabel,
+    required String triggerReason,
+    required double confidence,
+    required int repeatCount,
+    required bool intentTrigger,
+    required bool confidenceTrigger,
+    required bool repeatTrigger,
+    required bool manualTrigger,
+    required List<double> embedding,
+  }) async {
+    try {
+      if (mounted) {
+        setState(() {
+          _memoryStatus = 'saving';
+        });
+      }
+      await _cloud.uploadScreenshot(
+        sessionId: sessionId,
+        imageBytes: frame,
+        userLabel: userLabel,
+        aiLabel: aiLabel,
+        triggerReason: triggerReason,
+        confidence: confidence,
+        repeatCount: repeatCount,
+        intentTrigger: intentTrigger,
+        confidenceTrigger: confidenceTrigger,
+        repeatTrigger: repeatTrigger,
+        manualTrigger: manualTrigger,
+        width: _latestFrameWidth,
+        height: _latestFrameHeight,
+        frameTimestamp: _latestFrameAt?.toUtc().toIso8601String(),
+        embedding: embedding,
+      );
+      _lastMemoryUploadAt = DateTime.now();
+      if (userLabel.isNotEmpty) {
+        _lastUploadedLabel = userLabel;
+      }
+      if (mounted) {
+        setState(() {
+          _savedMemories++;
+          _memoryStatus = 'saved';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _memoryStatus = 'error';
+          _lastError = 'Memory save failed: $error';
+        });
+      }
+    }
+  }
+
+  Future<void> _maybeInjectMemoryHint({
+    required String sessionId,
+    required String label,
+    required List<double> embedding,
+  }) async {
+    final now = DateTime.now();
+    if (_lastHintLabel == label &&
+        _lastMemoryHintAt != null &&
+        now.difference(_lastMemoryHintAt!) < const Duration(seconds: 25)) {
+      return;
+    }
+
+    try {
+      final matches = await _cloud.matchScreenshots(
+        sessionId: sessionId,
+        userLabel: label,
+        aiLabel: label,
+        embedding: embedding,
+        topK: 1,
+        minScore: 0.55,
+      );
+      if (matches.isEmpty || !_gemini.isReady || !_isActive) {
+        return;
+      }
+
+      final top = matches.first;
+      final topLabel = _normalizeLabel(
+        (top['userLabel'] as String?) ?? (top['aiLabel'] as String?) ?? label,
+      );
+      final matchScore = (top['matchScore'] as num?)?.toDouble() ?? 0;
+      final hint =
+          'Memory hint: previously seen "$topLabel" with similarity score ${matchScore.toStringAsFixed(2)}. '
+          'Use this memory while guiding the user to find the object now.';
+
+      _gemini.sendText(hint);
+      _lastHintLabel = label;
+      _lastMemoryHintAt = now;
+    } catch (_) {
+      // Ignore memory lookup failures to avoid interrupting real-time assistance.
+    }
+  }
+
+  List<String> _extractLabels(String text) {
+    final labels = <String>[];
+    final bracketPattern = RegExp(r'\[([^\]]+)\]');
+    for (final match in bracketPattern.allMatches(text)) {
+      final content = (match.group(1) ?? '').trim();
+      if (content.isEmpty) {
+        continue;
+      }
+      final parts = content.split(',');
+      for (final raw in parts) {
+        final normalized = _normalizeLabel(raw);
+        if (normalized.isNotEmpty && !labels.contains(normalized)) {
+          labels.add(normalized);
+        }
+      }
+    }
+    return labels;
+  }
+
+  String _inferLabelFromText(String text) {
+    final patterns = [
+      RegExp(r'your\s+([a-z ]{2,40})'),
+      RegExp(r'found\s+(?:a|an|the)?\s*([a-z ]{2,40})'),
+      RegExp(r'identified\s+(?:a|an|the)?\s*([a-z ]{2,40})'),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final label = _normalizeLabel(match.group(1) ?? '');
+      if (label.isNotEmpty) {
+        return label;
+      }
+    }
+    return '';
+  }
+
+  String _normalizeLabel(String value) {
+    return value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  bool _containsAny(String text, List<String> terms) {
+    for (final term in terms) {
+      if (text.contains(term)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  List<double> _buildLabelEmbedding(String text) {
+    if (text.isEmpty) {
+      return const <double>[];
+    }
+    const dims = 24;
+    final vector = List<double>.filled(dims, 0);
+    final codeUnits = text.toLowerCase().codeUnits;
+    for (var i = 0; i < codeUnits.length; i++) {
+      final bucket = i % dims;
+      vector[bucket] += (codeUnits[i] % 97) / 97.0;
+    }
+    return vector;
   }
 
   void _cancelSubscriptions() {
@@ -552,6 +882,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Text('audioSent=$_audioChunksSent audioReceived=$_audioChunksReceived'),
             Text('framesSent=$_framesSent stream=$_isStreamingFrames'),
             Text('assistantSpeaking=$_assistantSpeaking'),
+            Text('memory=$_memoryStatus saved=$_savedMemories'),
             Text('zoom=${_zoomLevel.toStringAsFixed(2)}x'),
             if (_audio.lastPlaybackError != null)
               Text('playback=${_audio.lastPlaybackError}'),
