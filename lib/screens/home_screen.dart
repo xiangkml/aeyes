@@ -935,10 +935,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   String _recognitionObjectName(String label) {
+    const genericObjectNames = {
+      'object',
+      'item',
+      'thing',
+      'stuff',
+      'belonging',
+      'property',
+    };
+
     final text = _normalizeLabel(label)
         .replaceFirst("user's ", '')
         .replaceFirst("other person's ", '')
         .replaceFirst("someone else's ", '');
+
+    if (genericObjectNames.contains(text)) {
+      return '';
+    }
 
     final words = text
         .split(' ')
@@ -963,6 +976,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final joined = words.take(3).join(' ');
+    if (genericObjectNames.contains(joined)) {
+      return '';
+    }
     return joined;
   }
 
@@ -1027,13 +1043,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       RegExp(r"\bsave\s+this\s+object\s+as\s+([a-z0-9' ]{2,50})"),
       RegExp(r"\bsave\s+this\s+item\s+as\s+([a-z0-9' ]{2,50})"),
       RegExp(r"\bsave\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+my\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+the\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bremember\s+my\s+([a-z0-9' ]{2,50})"),
     ];
     for (final pattern in patterns) {
       final match = pattern.firstMatch(text);
       if (match == null) {
         continue;
       }
-      final label = _canonicalObjectLabel(match.group(1) ?? '');
+      var raw = _normalizeLabel(match.group(1) ?? '');
+      raw = raw
+          .replaceFirst(RegExp(r'^(object|item|thing)\s+as\s+'), '')
+          .replaceFirst(RegExp(r'^(object|item|thing)\s+'), '')
+          .trim();
+      final label = _canonicalObjectLabel(raw);
       if (label.isNotEmpty) {
         return label;
       }
