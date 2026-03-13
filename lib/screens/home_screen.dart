@@ -45,6 +45,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _lastTranscript = '';
   String _lastError = '';
   String _sceneSummary = '';
+  String _aiAction = 'Idle';
   String _cloudStatus = cloudBackendBaseUrl.trim().isEmpty ? 'disabled' : 'idle';
   int _audioChunksSent = 0;
   int _framesSent = 0;
@@ -169,6 +170,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (mounted) {
       setState(() {
         _status = 'Connecting...';
+        _aiAction = 'Connecting to AI';
         _isActive = true;
         _lastError = '';
         _lastTranscript = '';
@@ -194,18 +196,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         switch (state) {
           case GeminiConnectionState.connecting:
             _status = 'Connecting...';
+            _aiAction = 'Connecting to AI';
             break;
           case GeminiConnectionState.ready:
             _status = 'Listening...';
+            _aiAction = 'Listening';
             break;
           case GeminiConnectionState.error:
             _status = 'Connection error';
             _isActive = false;
             _lastError = _gemini.lastCloseReason ?? 'Gemini stream error';
+            _aiAction = 'Gemini stream failed';
             break;
           case GeminiConnectionState.disconnected:
             _status = 'Disconnected';
             _isActive = false;
+            _aiAction = 'Disconnected';
             break;
         }
       });
@@ -308,6 +314,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (mounted) {
       setState(() {
         _status = 'Assistant is greeting you...';
+        _aiAction = 'Greeting user';
       });
     }
   }
@@ -475,6 +482,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _lastMemoryHintAt = null;
     _lastHintLabel = '';
     _memoryStatus = _cloud.isEnabled ? 'idle' : 'disabled';
+    _aiAction = _cloud.isEnabled ? 'Idle' : 'Cloud disabled';
     unawaited(_stopFrameStream());
     _audio.stopRecording();
     _audio.clearPlayback();
@@ -530,6 +538,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _cloudStatus = 'synced';
+          _aiAction = _savedMemories > 0 ? 'Memory synced to cloud' : 'Context synced';
         });
       }
     } catch (error) {
@@ -552,7 +561,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final now = DateTime.now();
     final lower = text.toLowerCase();
     final labels = _extractLabels(text);
-    final primaryLabel = labels.isNotEmpty ? labels.first : _inferLabelFromText(lower);
+    final ownershipLabel = _extractOwnershipLabel(lower);
+    final findTargetLabel = _extractFindTargetLabel(lower);
+    final inferredLabel = _inferLabelFromText(lower);
+    final primaryLabelRaw = ownershipLabel.isNotEmpty
+      ? ownershipLabel
+      : labels.isNotEmpty
+        ? labels.first
+        : findTargetLabel.isNotEmpty
+          ? findTargetLabel
+          : inferredLabel;
+    final primaryLabel = _canonicalObjectLabel(primaryLabelRaw);
+    final aiLabels = labels
+      .map(_canonicalObjectLabel)
+      .where((item) => item.isNotEmpty)
+      .toSet()
+      .toList(growable: false);
+    final aiLabelsForUpload = aiLabels.isNotEmpty
+        ? aiLabels
+        : [
+            if (primaryLabel.isNotEmpty) primaryLabel,
+            if (inferredLabel.isNotEmpty) _canonicalObjectLabel(inferredLabel),
+            if (findTargetLabel.isNotEmpty) _canonicalObjectLabel(findTargetLabel),
+          ].where((item) => item.isNotEmpty).toSet().toList(growable: false);
+    final hasLabel = primaryLabel.isNotEmpty || aiLabels.isNotEmpty;
 
     bool intentTrigger = _containsAny(
       lower,
@@ -562,6 +594,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'recognize',
         'identify',
         'searching for',
+        'where is',
+        'locate',
       ],
     );
     bool confidenceTrigger = _containsAny(
@@ -583,6 +617,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'i will save this',
       ],
     );
+    final ownershipTrigger = ownershipLabel.isNotEmpty;
 
     int repeatCount = 0;
     bool repeatTrigger = false;
@@ -592,7 +627,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       repeatTrigger = repeatCount >= _repeatLabelThreshold;
     }
 
-    if (!intentTrigger && !confidenceTrigger && !repeatTrigger && !manualTrigger) {
+    if (!intentTrigger &&
+        !confidenceTrigger &&
+        !repeatTrigger &&
+        !manualTrigger &&
+        !ownershipTrigger) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        if (manualTrigger) {
+          _aiAction = 'User asked AI to save object';
+        } else if (ownershipTrigger) {
+          _aiAction = 'AI recognized ownership and is saving object memory';
+        } else if (confidenceTrigger) {
+          _aiAction = 'AI found object and is saving memory';
+        } else if (repeatTrigger) {
+          _aiAction = 'AI saw object repeatedly, saving memory';
+        } else {
+          _aiAction = 'AI triggered object memory save';
+        }
+      });
+    }
+
+    if (!hasLabel) {
+      if (mounted) {
+        setState(() {
+          _aiAction = 'Waiting for AI label before saving screenshot';
+        });
+      }
       return;
     }
 
@@ -606,7 +670,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final confidence = confidenceTrigger ? 0.88 : (repeatTrigger ? 0.72 : 0.61);
-    final embedText = ([primaryLabel, ...labels].where((item) => item.isNotEmpty).join(' ')).trim();
+    final embedText = ([primaryLabel, ...aiLabelsForUpload].where((item) => item.isNotEmpty).join(' ')).trim();
     final embedding = _buildLabelEmbedding(embedText);
 
     if (intentTrigger && primaryLabel.isNotEmpty) {
@@ -623,8 +687,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       sessionId: sessionId,
       frame: latestFrame,
       userLabel: primaryLabel,
-      aiLabel: labels.join(', '),
-      triggerReason: manualTrigger
+      aiLabel: aiLabelsForUpload.join(', '),
+        triggerReason: ownershipTrigger
+          ? 'ownership'
+          : manualTrigger
           ? 'manual'
           : confidenceTrigger
               ? 'confidence'
@@ -659,6 +725,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _memoryStatus = 'saving';
+          _aiAction = 'Uploading screenshot to cloud';
         });
       }
       await _cloud.uploadScreenshot(
@@ -686,6 +753,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         setState(() {
           _savedMemories++;
           _memoryStatus = 'saved';
+          _aiAction = 'Screenshot saved to database';
         });
       }
     } catch (error) {
@@ -693,6 +761,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         setState(() {
           _memoryStatus = 'error';
           _lastError = 'Memory save failed: $error';
+          _aiAction = 'Failed to save screenshot';
         });
       }
     }
@@ -735,6 +804,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _gemini.sendText(hint);
       _lastHintLabel = label;
       _lastMemoryHintAt = now;
+      if (mounted) {
+        setState(() {
+          _aiAction = 'Using saved memory to guide search';
+        });
+      }
     } catch (_) {
       // Ignore memory lookup failures to avoid interrupting real-time assistance.
     }
@@ -750,7 +824,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       final parts = content.split(',');
       for (final raw in parts) {
-        final normalized = _normalizeLabel(raw);
+        final normalized = _canonicalObjectLabel(raw);
         if (normalized.isNotEmpty && !labels.contains(normalized)) {
           labels.add(normalized);
         }
@@ -764,6 +838,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       RegExp(r'your\s+([a-z ]{2,40})'),
       RegExp(r'found\s+(?:a|an|the)?\s*([a-z ]{2,40})'),
       RegExp(r'identified\s+(?:a|an|the)?\s*([a-z ]{2,40})'),
+      RegExp(r"(?:this|that|it)(?:'s| is)\s+(?:my|your|the|a|an)?\s*([a-z ]{2,40})"),
     ];
     for (final pattern in patterns) {
       final match = pattern.firstMatch(text);
@@ -772,7 +847,106 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       final label = _normalizeLabel(match.group(1) ?? '');
       if (label.isNotEmpty) {
-        return label;
+        return _canonicalObjectLabel(label);
+      }
+    }
+    return '';
+  }
+
+  String _canonicalObjectLabel(String value) {
+    final normalized = _normalizeLabel(value);
+    if (normalized.isEmpty) {
+      return '';
+    }
+
+    const genericLabels = {
+      'object',
+      'item',
+      'thing',
+      'stuff',
+      'belonging',
+      'property',
+    };
+    if (genericLabels.contains(normalized)) {
+      return '';
+    }
+
+    final withoutArticles = normalized
+        .replaceFirst(RegExp(r'^(a|an|the)\s+'), '')
+        .replaceFirst(RegExp(r'^my\s+'), "user's ")
+        .replaceFirst(RegExp(r'^your\s+'), "user's ")
+      .replaceFirst(RegExp(r'^user\s+'), "user's ")
+      .replaceFirst(RegExp(r'^his\s+'), "other person's ")
+      .replaceFirst(RegExp(r'^her\s+'), "other person's ")
+      .replaceFirst(RegExp(r'^their\s+'), "other person's ")
+      .replaceFirst(RegExp(r"^someone else's\s+"), "other person's ");
+
+    if (withoutArticles == 'user') {
+      return "user's object";
+    }
+    if (withoutArticles.startsWith("user's ")) {
+      return withoutArticles;
+    }
+    if (withoutArticles.startsWith("other person's ")) {
+      return withoutArticles;
+    }
+    if (genericLabels.contains(withoutArticles)) {
+      return '';
+    }
+    return withoutArticles;
+  }
+
+  String _extractOwnershipLabel(String text) {
+    final userPatterns = <RegExp>[
+      RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+my\s+([a-z0-9 ]{2,40})"),
+      RegExp(r"\bthis\s+belongs\s+to\s+me\s+(?:it's\s+)?([a-z0-9 ]{2,40})"),
+    ];
+    for (final pattern in userPatterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final object = _normalizeLabel(match.group(1) ?? '');
+      if (object.isNotEmpty) {
+        return "user's $object";
+      }
+    }
+
+    final otherPatterns = <RegExp>[
+      RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+his\s+([a-z0-9 ]{2,40})"),
+      RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+her\s+([a-z0-9 ]{2,40})"),
+      RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+their\s+([a-z0-9 ]{2,40})"),
+      RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+someone else's\s+([a-z0-9 ]{2,40})"),
+    ];
+    for (final pattern in otherPatterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final object = _normalizeLabel(match.group(1) ?? '');
+      if (object.isNotEmpty) {
+        return "other person's $object";
+      }
+    }
+
+    return '';
+  }
+
+  String _extractFindTargetLabel(String text) {
+    final patterns = <RegExp>[
+      RegExp(r"\bfind\s+(?:my|the|a|an)?\s*([a-z0-9 ]{2,40})"),
+      RegExp(r"\blook\s+for\s+(?:my|the|a|an)?\s*([a-z0-9 ]{2,40})"),
+      RegExp(r"\bwhere\s+is\s+(?:my|the|a|an)?\s*([a-z0-9 ]{2,40})"),
+      RegExp(r"\blocate\s+(?:my|the|a|an)?\s*([a-z0-9 ]{2,40})"),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final object = _normalizeLabel(match.group(1) ?? '');
+      if (object.isNotEmpty) {
+        return _canonicalObjectLabel(object);
       }
     }
     return '';
@@ -883,6 +1057,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Text('framesSent=$_framesSent stream=$_isStreamingFrames'),
             Text('assistantSpeaking=$_assistantSpeaking'),
             Text('memory=$_memoryStatus saved=$_savedMemories'),
+            Text('aiAction=$_aiAction'),
             Text('zoom=${_zoomLevel.toStringAsFixed(2)}x'),
             if (_audio.lastPlaybackError != null)
               Text('playback=${_audio.lastPlaybackError}'),
