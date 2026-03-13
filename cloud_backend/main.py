@@ -260,18 +260,19 @@ async def upload_screenshot(request: web.Request) -> web.Response:
         return web.json_response({"error": "GCS_BUCKET_NAME is not configured"}, status=503)
 
     multipart = await request.multipart()
-    image_part = None
+    image_bytes = None
     fields = {}
 
     async for part in multipart:
         if part.name == "image":
-            image_part = part
+            image_bytes, read_error = await _read_image_part(part)
+            if read_error is not None:
+                return read_error
             continue
         fields[part.name] = await part.text()
 
-    image_bytes, read_error = await _read_image_part(image_part)
-    if read_error is not None:
-        return read_error
+    if image_bytes is None:
+        return web.json_response({"error": "missing image part"}, status=400)
 
     metadata = {}
     if "metadata" in fields and fields["metadata"].strip():
