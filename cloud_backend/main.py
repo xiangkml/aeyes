@@ -71,6 +71,47 @@ def parse_embedding(value):
     return None
 
 
+def parse_label_aliases(value):
+    if value is None:
+        return []
+    aliases = []
+    if isinstance(value, list):
+        aliases = [str(item) for item in value if str(item).strip()]
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        # Backward compatible: old payloads can send comma-separated aiLabel text.
+        aliases = [item.strip() for item in text.split(",") if item.strip()]
+    else:
+        return []
+
+    deduped = []
+    seen = set()
+    for item in aliases:
+        normalized = normalize_label(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+    return deduped
+
+
+def is_generic_object_label(value: str) -> bool:
+    normalized = normalize_label(value)
+    if not normalized:
+        return True
+    return normalized in {
+        "object",
+        "item",
+        "thing",
+        "stuff",
+        "belonging",
+        "property",
+        "user's object",
+        "other person's object",
+    }
+
+
 def parse_bool(value):
     if isinstance(value, bool):
         return value
@@ -100,6 +141,32 @@ def build_signed_url(bucket, object_path: str):
     except Exception:
         logging.exception("failed to generate signed URL for %s", object_path)
         return None, None
+
+
+def build_proxy_image_url(request: web.Request, session_id: str, screenshot_id: str) -> str:
+    return str(
+        request.url.with_path(
+            f"/v1/sessions/{session_id}/screenshots/{screenshot_id}/image"
+        ).with_query({})
+    )
+
+
+def attach_best_image_url(request: web.Request, data: dict, bucket):
+    object_path = data.get("gcsObjectPath", "")
+    signed_url, signed_expires_at = build_signed_url(bucket, object_path)
+    if signed_url:
+        data["imageUrl"] = signed_url
+        data["imageUrlExpiresAt"] = signed_expires_at
+        return signed_url, signed_expires_at
+
+    session_id = data.get("sessionId", "")
+    screenshot_id = data.get("screenshotId", "")
+    if session_id and screenshot_id:
+        data["imageUrl"] = build_proxy_image_url(request, session_id, screenshot_id)
+        data["imageUrlExpiresAt"] = None
+        return data["imageUrl"], None
+
+    return None, None
 
 
 def cosine_similarity(left, right):
@@ -300,13 +367,42 @@ async def upload_screenshot(request: web.Request) -> web.Response:
         except json.JSONDecodeError:
             return web.json_response({"error": "metadata must be valid JSON"}, status=400)
 
-    user_label = fields.get("userLabel") or metadata.get("userLabel") or ""
-    ai_label = fields.get("aiLabel") or metadata.get("aiLabel") or ""
-    if not user_label.strip() and not ai_label.strip():
+    object_label = fields.get("objectLabel") or metadata.get("objectLabel") or ""
+    label_aliases = parse_label_aliases(fields.get("labelAliases") or metadata.get("labelAliases"))
+
+    # Backward compatibility with old userLabel/aiLabel clients.
+    legacy_user_label = fields.get("userLabel") or metadata.get("userLabel") or ""
+    legacy_ai_label = fields.get("aiLabel") or metadata.get("aiLabel") or ""
+    if not object_label.strip():
+        object_label = legacy_user_label
+    if not object_label.strip() and legacy_ai_label.strip():
+        fallback_aliases = parse_label_aliases(legacy_ai_label)
+        if fallback_aliases:
+            object_label = fallback_aliases[0]
+            label_aliases = fallback_aliases[1:] + label_aliases
+
+    normalized_object_label = normalize_label(object_label)
+    if not normalized_object_label:
         return web.json_response(
             {"error": "object label is required before screenshot upload"},
             status=400,
         )
+    if is_generic_object_label(normalized_object_label):
+        return web.json_response(
+            {"error": "object label must be specific, not generic"},
+            status=400,
+        )
+
+    merged_aliases = []
+    for raw in [*label_aliases, *parse_label_aliases(legacy_ai_label), legacy_user_label]:
+        normalized = normalize_label(raw)
+        if (
+            normalized
+            and normalized != normalized_object_label
+            and not is_generic_object_label(normalized)
+            and normalized not in merged_aliases
+        ):
+            merged_aliases.append(normalized)
     trigger_reason = fields.get("triggerReason") or metadata.get("triggerReason") or "unknown"
     confidence = safe_float(fields.get("confidence") or metadata.get("confidence"))
     repeat_count = int(safe_float(fields.get("repeatCount") or metadata.get("repeatCount")) or 0)
@@ -332,14 +428,18 @@ async def upload_screenshot(request: web.Request) -> web.Response:
     blob = bucket.blob(object_path)
     blob.upload_from_string(image_bytes, content_type="image/jpeg")
     signed_url, signed_expires_at = build_signed_url(bucket, object_path)
+    proxy_image_url = build_proxy_image_url(request, session_id, screenshot_id)
 
-    labels = [item for item in [user_label, ai_label] if item]
+    labels = [normalized_object_label, *merged_aliases]
     screenshot_doc = {
         "screenshotId": screenshot_id,
         "sessionId": session_id,
-        "userLabel": user_label,
-        "aiLabel": ai_label,
-        "normalizedLabels": [normalize_label(item) for item in labels],
+        "objectLabel": normalized_object_label,
+        "labelAliases": merged_aliases,
+        # Backward-compatible fields for older clients/readers.
+        "userLabel": normalized_object_label,
+        "aiLabel": ", ".join(merged_aliases),
+        "normalizedLabels": labels,
         "triggerReason": trigger_reason,
         "triggerFlags": trigger_flags,
         "confidence": confidence,
@@ -351,7 +451,7 @@ async def upload_screenshot(request: web.Request) -> web.Response:
         "gcsBucket": gcs_bucket_name,
         "gcsObjectPath": object_path,
         "gcsPath": f"gs://{gcs_bucket_name}/{object_path}",
-        "imageUrl": signed_url,
+        "imageUrl": signed_url or proxy_image_url,
         "imageUrlExpiresAt": signed_expires_at,
         "createdAt": created_at,
         "lastSeenAt": created_at,
@@ -361,7 +461,7 @@ async def upload_screenshot(request: web.Request) -> web.Response:
     doc_ref.set(
         {
             "lastScreenshotAt": created_at,
-            "lastScreenshotLabel": user_label or ai_label,
+            "lastScreenshotLabel": normalized_object_label,
             "updatedAt": utc_now(),
         },
         merge=True,
@@ -371,12 +471,15 @@ async def upload_screenshot(request: web.Request) -> web.Response:
         {
             "ok": True,
             "screenshotId": screenshot_id,
-            "imageUrl": signed_url,
+            "imageUrl": signed_url or proxy_image_url,
             "imageUrlExpiresAt": signed_expires_at,
             "gcsPath": screenshot_doc["gcsPath"],
             "labels": {
-                "userLabel": user_label,
-                "aiLabel": ai_label,
+                "objectLabel": normalized_object_label,
+                "labelAliases": merged_aliases,
+                # Backward-compatible response keys.
+                "userLabel": normalized_object_label,
+                "aiLabel": ", ".join(merged_aliases),
             },
         },
         status=201,
@@ -407,14 +510,11 @@ async def list_screenshots(request: web.Request) -> web.Response:
     items = []
     for snapshot in snapshots:
         data = snapshot.to_dict() or {}
-        object_path = data.get("gcsObjectPath", "")
-        signed_url, signed_expires_at = build_signed_url(bucket, object_path)
+        signed_url, signed_expires_at = attach_best_image_url(request, data, bucket)
         if signed_url:
-            data["imageUrl"] = signed_url
-            data["imageUrlExpiresAt"] = signed_expires_at
             snapshot.reference.set(
                 {
-                    "imageUrl": signed_url,
+                    "imageUrl": data.get("imageUrl"),
                     "imageUrlExpiresAt": signed_expires_at,
                 },
                 merge=True,
@@ -433,10 +533,10 @@ async def match_screenshots(request: web.Request) -> web.Response:
         return web.json_response({"error": "GCS_BUCKET_NAME is not configured"}, status=503)
 
     payload = await request.json() if request.can_read_body else {}
-    query_user_label = payload.get("userLabel", "")
-    query_ai_label = payload.get("aiLabel", "")
+    query_object_label = payload.get("objectLabel") or payload.get("userLabel", "")
+    query_aliases = parse_label_aliases(payload.get("labelAliases") or payload.get("aiLabel"))
     query_embedding = parse_embedding(payload.get("embedding"))
-    query_labels = [query_user_label, query_ai_label]
+    query_labels = [normalize_label(query_object_label), *query_aliases]
     top_k = max(1, min(20, int(payload.get("topK", 5))))
     min_score = safe_float(payload.get("minScore"))
     min_score = 0.2 if min_score is None else max(0.0, min(1.0, min_score))
@@ -452,10 +552,14 @@ async def match_screenshots(request: web.Request) -> web.Response:
     candidates = []
     for snapshot in snapshots:
         data = snapshot.to_dict() or {}
-        candidate_labels = data.get("normalizedLabels") or [
-            data.get("userLabel", ""),
-            data.get("aiLabel", ""),
-        ]
+        candidate_labels = data.get("normalizedLabels") or []
+        if not candidate_labels:
+            candidate_labels = [
+                data.get("objectLabel", ""),
+                *(data.get("labelAliases") or []),
+                data.get("userLabel", ""),
+                data.get("aiLabel", ""),
+            ]
         label_score = label_similarity(query_labels, candidate_labels)
         vector_score = cosine_similarity(query_embedding, parse_embedding(data.get("embedding")))
 
@@ -469,11 +573,7 @@ async def match_screenshots(request: web.Request) -> web.Response:
         if combined_score < min_score:
             continue
 
-        object_path = data.get("gcsObjectPath", "")
-        signed_url, signed_expires_at = build_signed_url(bucket, object_path)
-        if signed_url:
-            data["imageUrl"] = signed_url
-            data["imageUrlExpiresAt"] = signed_expires_at
+        attach_best_image_url(request, data, bucket)
 
         data["matchScore"] = round(combined_score, 5)
         data["labelScore"] = round(label_score, 5)
@@ -489,10 +589,10 @@ async def search_memories(request: web.Request) -> web.Response:
         return web.json_response({"error": "GCS_BUCKET_NAME is not configured"}, status=503)
 
     payload = await request.json() if request.can_read_body else {}
-    query_user_label = payload.get("userLabel", "")
-    query_ai_label = payload.get("aiLabel", "")
+    query_object_label = payload.get("objectLabel") or payload.get("userLabel", "")
+    query_aliases = parse_label_aliases(payload.get("labelAliases") or payload.get("aiLabel"))
     query_embedding = parse_embedding(payload.get("embedding"))
-    query_labels = [query_user_label, query_ai_label]
+    query_labels = [normalize_label(query_object_label), *query_aliases]
     top_k = max(1, min(20, int(payload.get("topK", 5))))
     min_score = safe_float(payload.get("minScore"))
     min_score = 0.2 if min_score is None else max(0.0, min(1.0, min_score))
@@ -500,7 +600,6 @@ async def search_memories(request: web.Request) -> web.Response:
     bucket = storage_client.bucket(gcs_bucket_name)
     snapshots = (
         db.collection_group("screenshots")
-        .order_by("createdAt", direction=firestore.Query.DESCENDING)
         .limit(300)
         .stream()
     )
@@ -508,10 +607,14 @@ async def search_memories(request: web.Request) -> web.Response:
     candidates = []
     for snapshot in snapshots:
         data = snapshot.to_dict() or {}
-        candidate_labels = data.get("normalizedLabels") or [
-            data.get("userLabel", ""),
-            data.get("aiLabel", ""),
-        ]
+        candidate_labels = data.get("normalizedLabels") or []
+        if not candidate_labels:
+            candidate_labels = [
+                data.get("objectLabel", ""),
+                *(data.get("labelAliases") or []),
+                data.get("userLabel", ""),
+                data.get("aiLabel", ""),
+            ]
         label_score = label_similarity(query_labels, candidate_labels)
         vector_score = cosine_similarity(query_embedding, parse_embedding(data.get("embedding")))
 
@@ -525,11 +628,7 @@ async def search_memories(request: web.Request) -> web.Response:
         if combined_score < min_score:
             continue
 
-        object_path = data.get("gcsObjectPath", "")
-        signed_url, signed_expires_at = build_signed_url(bucket, object_path)
-        if signed_url:
-            data["imageUrl"] = signed_url
-            data["imageUrlExpiresAt"] = signed_expires_at
+        attach_best_image_url(request, data, bucket)
 
         data["matchScore"] = round(combined_score, 5)
         data["labelScore"] = round(label_score, 5)
@@ -538,6 +637,33 @@ async def search_memories(request: web.Request) -> web.Response:
 
     candidates.sort(key=lambda item: item.get("matchScore", 0.0), reverse=True)
     return web.json_response({"items": candidates[:top_k]})
+
+
+async def get_screenshot_image(request: web.Request) -> web.Response:
+    session_id = request.match_info["session_id"]
+    screenshot_id = request.match_info["screenshot_id"]
+    doc_ref, error = ensure_session_exists(session_id)
+    if error is not None:
+        return error
+    if not gcs_bucket_name:
+        return web.json_response({"error": "GCS_BUCKET_NAME is not configured"}, status=503)
+
+    screenshot_doc = (
+        doc_ref.collection("screenshots").document(screenshot_id).get().to_dict() or {}
+    )
+    object_path = screenshot_doc.get("gcsObjectPath", "")
+    if not object_path:
+        return web.json_response({"error": "screenshot not found"}, status=404)
+
+    try:
+        blob = storage_client.bucket(gcs_bucket_name).blob(object_path)
+        if not blob.exists():
+            return web.json_response({"error": "image object not found"}, status=404)
+        payload = blob.download_as_bytes()
+        return web.Response(body=payload, content_type="image/jpeg")
+    except Exception:
+        logging.exception("failed to stream screenshot image for %s/%s", session_id, screenshot_id)
+        return web.json_response({"error": "failed to load screenshot image"}, status=500)
 
 
 async def live_proxy(request: web.Request) -> web.StreamResponse:
@@ -632,6 +758,10 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/sessions/{session_id}", get_session)
     app.router.add_post("/v1/sessions/{session_id}/screenshots", upload_screenshot)
     app.router.add_get("/v1/sessions/{session_id}/screenshots", list_screenshots)
+    app.router.add_get(
+        "/v1/sessions/{session_id}/screenshots/{screenshot_id}/image",
+        get_screenshot_image,
+    )
     app.router.add_post("/v1/sessions/{session_id}/screenshots/match", match_screenshots)
     app.router.add_post("/v1/memory/search", search_memories)
     app.router.add_get("/v1/live", live_proxy)

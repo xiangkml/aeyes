@@ -84,8 +84,8 @@ class CloudAgentService {
   Future<Map<String, dynamic>> uploadScreenshot({
     required String sessionId,
     required Uint8List imageBytes,
-    String userLabel = '',
-    String aiLabel = '',
+    required String objectLabel,
+    List<String> labelAliases = const <String>[],
     String triggerReason = 'unknown',
     double? confidence,
     int repeatCount = 0,
@@ -107,9 +107,18 @@ class CloudAgentService {
       Uri.parse('${cloudBackendBaseUrl.trim()}/v1/sessions/$sessionId/screenshots'),
     );
 
+    final normalizedAliases = labelAliases
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toSet()
+        .toList(growable: false);
+
     final metadata = {
-      'userLabel': userLabel,
-      'aiLabel': aiLabel,
+      'objectLabel': objectLabel,
+      'labelAliases': normalizedAliases,
+      // Backward compatibility for older backend deployments.
+      'userLabel': objectLabel,
+      'aiLabel': normalizedAliases.join(', '),
       'triggerReason': triggerReason,
       'confidence': confidence,
       'repeatCount': repeatCount,
@@ -178,8 +187,8 @@ class CloudAgentService {
 
   Future<List<Map<String, dynamic>>> matchScreenshots({
     required String sessionId,
-    String userLabel = '',
-    String aiLabel = '',
+    required String objectLabel,
+    List<String> labelAliases = const <String>[],
     List<double>? embedding,
     int topK = 5,
     double minScore = 0.2,
@@ -192,8 +201,11 @@ class CloudAgentService {
       Uri.parse('${cloudBackendBaseUrl.trim()}/v1/sessions/$sessionId/screenshots/match'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
-        'userLabel': userLabel,
-        'aiLabel': aiLabel,
+        'objectLabel': objectLabel,
+        'labelAliases': labelAliases,
+        // Backward compatibility for older backend deployments.
+        'userLabel': objectLabel,
+        'aiLabel': labelAliases.join(', '),
         'embedding': embedding,
         'topK': topK,
         'minScore': minScore,
@@ -217,12 +229,13 @@ class CloudAgentService {
   }
 
   Future<List<Map<String, dynamic>>> searchMemories({
-    required String label,
+    required String objectLabel,
+    List<String> labelAliases = const <String>[],
     List<double>? embedding,
     int topK = 3,
     double minScore = 0.35,
   }) async {
-    if (!isEnabled || label.trim().isEmpty) {
+    if (!isEnabled || objectLabel.trim().isEmpty) {
       return const [];
     }
 
@@ -230,8 +243,11 @@ class CloudAgentService {
       Uri.parse('${cloudBackendBaseUrl.trim()}/v1/memory/search'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
-        'userLabel': label,
-        'aiLabel': label,
+        'objectLabel': objectLabel,
+        'labelAliases': labelAliases,
+        // Backward compatibility for older backend deployments.
+        'userLabel': objectLabel,
+        'aiLabel': labelAliases.isEmpty ? objectLabel : labelAliases.join(', '),
         'embedding': embedding,
         'topK': topK,
         'minScore': minScore,
