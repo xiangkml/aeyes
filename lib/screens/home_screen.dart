@@ -894,8 +894,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
       final matchScore = (top['matchScore'] as num?)?.toDouble() ?? 0;
       final hint =
-          'Memory hint: previously seen "$topLabel" with similarity score ${matchScore.toStringAsFixed(2)}. '
-          'Use this memory while guiding the user to find the object now. '
+          'MEMORY_HINT: prior user object "$topLabel" matched with score ${matchScore.toStringAsFixed(2)}. '
+          'Treat this as trusted saved memory for the current user. '
+          'Use this memory to identify ownership and give direct location guidance now. '
+          'Avoid repeated clarification loops unless confidence is low. '
           'A reference screenshot is being sent.';
 
       final imageUrl = (top['imageUrl'] as String?) ?? '';
