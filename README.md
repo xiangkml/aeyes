@@ -53,11 +53,50 @@ AEyes is an accessibility-first live visual assistant for blind and visually imp
 
 ```mermaid
 flowchart LR
-    A["Flutter iPhone app"] --> B["Cloud Run relay"]
-    A --> C["Firestore session sync"]
-    B --> D["Gemini Live API"]
-    B --> E["Cloud Logging"]
-    C --> E
+
+U[User]
+
+M[Mobile App - Flutter]
+
+V[Voice Input - Microphone]
+
+C[Vision Input - Camera Frames]
+
+A[Agent Controller]
+
+G[Gemini Live API]
+
+T[Tool Layer - Hazard Logic, Object Search]
+
+S[Session Memory - Firestore]
+
+R[Cloud Run Relay]
+
+L[Cloud Logging and Monitoring]
+
+O[Spoken Guidance and Transcript]
+
+
+
+U --> V --> M
+
+U --> C --> M
+
+M --> A
+
+A --> R
+
+R --> G
+
+A --> T
+
+T --> S
+
+R --> S
+
+R --> L
+
+G --> R --> A --> O --> U
 ```
 
 ### How data flows
