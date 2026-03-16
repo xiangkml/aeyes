@@ -230,6 +230,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _turnSub = _gemini.turnCompleteStream.listen((_) {
       _turnCompleteReceived = true;
       _audio.onTurnComplete();
+      final fullTurnText = _turnBuffer.toString().trim();
+      if (fullTurnText.isNotEmpty) {
+        unawaited(_evaluateScreenshotTrigger(fullTurnText));
+      }
       unawaited(_syncCloudContext());
     });
 
@@ -241,7 +245,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _lastTranscript = text;
       });
       _turnBuffer.write(text);
-      unawaited(_evaluateScreenshotTrigger(text));
       debugPrint('Gemini: $text');
     });
 
@@ -561,30 +564,67 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final now = DateTime.now();
     final lower = text.toLowerCase();
     final labels = _extractLabels(text);
+    final explicitSaveLabel = _extractExplicitSaveLabel(lower);
     final ownershipLabel = _extractOwnershipLabel(lower);
+    final possessiveLabel = _extractPossessiveMentionLabel(lower);
     final findTargetLabel = _extractFindTargetLabel(lower);
     final inferredLabel = _inferLabelFromText(lower);
-    final primaryLabelRaw = ownershipLabel.isNotEmpty
+    final primaryLabelRaw = explicitSaveLabel.isNotEmpty
+      ? explicitSaveLabel
+      : ownershipLabel.isNotEmpty
       ? ownershipLabel
+      : possessiveLabel.isNotEmpty
+      ? possessiveLabel
       : labels.isNotEmpty
         ? labels.first
         : findTargetLabel.isNotEmpty
           ? findTargetLabel
           : inferredLabel;
     final primaryLabel = _canonicalObjectLabel(primaryLabelRaw);
-    final aiLabels = labels
-      .map(_canonicalObjectLabel)
+    final primaryObjectName = _recognitionObjectName(primaryLabel);
+    final candidateAliases = labels
+      .map(_canonicalObjectNameLabel)
       .where((item) => item.isNotEmpty)
       .toSet()
       .toList(growable: false);
-    final aiLabelsForUpload = aiLabels.isNotEmpty
-        ? aiLabels
+    final aliasLabels = candidateAliases.isNotEmpty
+        ? candidateAliases
         : [
-            if (primaryLabel.isNotEmpty) primaryLabel,
-            if (inferredLabel.isNotEmpty) _canonicalObjectLabel(inferredLabel),
-            if (findTargetLabel.isNotEmpty) _canonicalObjectLabel(findTargetLabel),
+            if (primaryObjectName.isNotEmpty) primaryObjectName,
+            if (inferredLabel.isNotEmpty)
+              _canonicalObjectNameLabel(inferredLabel),
+            if (findTargetLabel.isNotEmpty)
+              _canonicalObjectNameLabel(findTargetLabel),
+            if (possessiveLabel.isNotEmpty)
+              _canonicalObjectNameLabel(possessiveLabel),
           ].where((item) => item.isNotEmpty).toSet().toList(growable: false);
-    final hasLabel = primaryLabel.isNotEmpty || aiLabels.isNotEmpty;
+    final objectLabel = primaryLabel.isNotEmpty
+        ? primaryLabel
+        : _canonicalObjectLabel(aliasLabels.isNotEmpty ? aliasLabels.first : '');
+    final normalizedAliasLabels = aliasLabels
+        .where((item) => item.isNotEmpty && item != objectLabel)
+        .toSet()
+        .toList(growable: false);
+    final hasLabel = _isMeaningfulObjectLabel(objectLabel);
+    final retrievalKeywordTrigger = _containsAny(
+      lower,
+      const [
+        'memory',
+        'remember',
+        "don't have memory",
+        'do not have memory',
+        'describe your',
+        'describe my',
+        'which one is',
+        'where is',
+        'find',
+        'look for',
+        'locate',
+      ],
+    );
+    bool retrievalTrigger = retrievalKeywordTrigger ||
+      possessiveLabel.isNotEmpty ||
+      findTargetLabel.isNotEmpty;
 
     bool intentTrigger = _containsAny(
       lower,
@@ -598,6 +638,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         'locate',
       ],
     );
+    retrievalTrigger = retrievalTrigger || (intentTrigger && hasLabel);
     bool confidenceTrigger = _containsAny(
       lower,
       const [
@@ -612,18 +653,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       lower,
       const [
         'save this object',
+        'save this object as',
         'save this item',
+        'save this item as',
+        'save as',
         'remember this object',
         'i will save this',
       ],
     );
+    if (explicitSaveLabel.isNotEmpty) {
+      manualTrigger = true;
+    }
     final ownershipTrigger = ownershipLabel.isNotEmpty;
 
     int repeatCount = 0;
     bool repeatTrigger = false;
-    if (primaryLabel.isNotEmpty) {
-      repeatCount = (_labelSeenCount[primaryLabel] ?? 0) + 1;
-      _labelSeenCount[primaryLabel] = repeatCount;
+    if (objectLabel.isNotEmpty) {
+      repeatCount = (_labelSeenCount[objectLabel] ?? 0) + 1;
+      _labelSeenCount[objectLabel] = repeatCount;
       repeatTrigger = repeatCount >= _repeatLabelThreshold;
     }
 
@@ -632,6 +679,32 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         !repeatTrigger &&
         !manualTrigger &&
         !ownershipTrigger) {
+      if (retrievalTrigger && hasLabel) {
+        final retrievalEmbedding = _buildLabelEmbedding(
+          ([
+            objectLabel,
+            primaryObjectName,
+            ...normalizedAliasLabels,
+          ].where((item) => item.isNotEmpty).join(' ')).trim(),
+        );
+        unawaited(
+          _maybeInjectMemoryHint(
+            sessionId: sessionId,
+            objectLabel: objectLabel,
+            labelAliases: normalizedAliasLabels,
+            embedding: retrievalEmbedding,
+          ),
+        );
+        if (mounted) {
+          setState(() {
+            _aiAction = 'Checking cloud memory for requested object';
+          });
+        }
+      } else if (retrievalTrigger && mounted) {
+        setState(() {
+          _aiAction = 'Memory query detected but no object label parsed';
+        });
+      }
       return;
     }
 
@@ -665,19 +738,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    if (primaryLabel.isNotEmpty && primaryLabel == _lastUploadedLabel) {
+    if (objectLabel.isNotEmpty && objectLabel == _lastUploadedLabel) {
       return;
     }
 
     final confidence = confidenceTrigger ? 0.88 : (repeatTrigger ? 0.72 : 0.61);
-    final embedText = ([primaryLabel, ...aiLabelsForUpload].where((item) => item.isNotEmpty).join(' ')).trim();
+    final embedText = ([
+      objectLabel,
+      primaryObjectName,
+      ...normalizedAliasLabels,
+    ].where((item) => item.isNotEmpty).join(' ')).trim();
     final embedding = _buildLabelEmbedding(embedText);
 
-    if (intentTrigger && primaryLabel.isNotEmpty) {
+    if (intentTrigger && objectLabel.isNotEmpty) {
       unawaited(
         _maybeInjectMemoryHint(
           sessionId: sessionId,
-          label: primaryLabel,
+          objectLabel: objectLabel,
+          labelAliases: normalizedAliasLabels,
           embedding: embedding,
         ),
       );
@@ -686,8 +764,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _uploadObjectMemorySnapshot(
       sessionId: sessionId,
       frame: latestFrame,
-      userLabel: primaryLabel,
-      aiLabel: aiLabelsForUpload.join(', '),
+      objectLabel: objectLabel,
+      labelAliases: normalizedAliasLabels,
         triggerReason: ownershipTrigger
           ? 'ownership'
           : manualTrigger
@@ -710,8 +788,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _uploadObjectMemorySnapshot({
     required String sessionId,
     required Uint8List frame,
-    required String userLabel,
-    required String aiLabel,
+    required String objectLabel,
+    required List<String> labelAliases,
     required String triggerReason,
     required double confidence,
     required int repeatCount,
@@ -731,8 +809,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await _cloud.uploadScreenshot(
         sessionId: sessionId,
         imageBytes: frame,
-        userLabel: userLabel,
-        aiLabel: aiLabel,
+        objectLabel: objectLabel,
+        labelAliases: labelAliases,
         triggerReason: triggerReason,
         confidence: confidence,
         repeatCount: repeatCount,
@@ -746,8 +824,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         embedding: embedding,
       );
       _lastMemoryUploadAt = DateTime.now();
-      if (userLabel.isNotEmpty) {
-        _lastUploadedLabel = userLabel;
+      if (objectLabel.isNotEmpty) {
+        _lastUploadedLabel = objectLabel;
       }
       if (mounted) {
         setState(() {
@@ -769,53 +847,96 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _maybeInjectMemoryHint({
     required String sessionId,
-    required String label,
+    required String objectLabel,
+    required List<String> labelAliases,
     required List<double> embedding,
   }) async {
     final now = DateTime.now();
-    if (_lastHintLabel == label &&
+    if (_lastHintLabel == objectLabel &&
         _lastMemoryHintAt != null &&
         now.difference(_lastMemoryHintAt!) < const Duration(seconds: 25)) {
       return;
     }
 
     try {
-      final matches = await _cloud.matchScreenshots(
+      var matches = await _cloud.matchScreenshots(
         sessionId: sessionId,
-        userLabel: label,
-        aiLabel: label,
+        objectLabel: objectLabel,
+        labelAliases: labelAliases,
         embedding: embedding,
         topK: 1,
         minScore: 0.55,
       );
+      if (matches.isEmpty) {
+        matches = await _cloud.searchMemories(
+          objectLabel: objectLabel,
+          labelAliases: labelAliases,
+          embedding: embedding,
+          topK: 1,
+          minScore: 0.25,
+        );
+      }
       if (matches.isEmpty || !_gemini.isReady || !_isActive) {
+        if (mounted) {
+          setState(() {
+            _aiAction = 'No matching memory found for requested object';
+          });
+        }
         return;
       }
 
       final top = matches.first;
       final topLabel = _normalizeLabel(
-        (top['userLabel'] as String?) ?? (top['aiLabel'] as String?) ?? label,
+        (top['objectLabel'] as String?) ??
+            (top['userLabel'] as String?) ??
+            (top['aiLabel'] as String?) ??
+            objectLabel,
       );
       final matchScore = (top['matchScore'] as num?)?.toDouble() ?? 0;
       final hint =
-          'Memory hint: previously seen "$topLabel" with similarity score ${matchScore.toStringAsFixed(2)}. '
-          'Use this memory while guiding the user to find the object now.';
+          'MEMORY_HINT: prior user object "$topLabel" matched with score ${matchScore.toStringAsFixed(2)}. '
+          'Treat this as trusted saved memory for the current user. '
+          'Use this memory to identify ownership and give direct location guidance now. '
+          'Avoid repeated clarification loops unless confidence is low. '
+          'A reference screenshot is being sent.';
+
+      final imageUrl = (top['imageUrl'] as String?) ?? '';
+      final referenceImage = await _cloud.downloadImageBytes(imageUrl);
+      if (referenceImage != null && referenceImage.isNotEmpty) {
+        _gemini.sendImage(referenceImage);
+      }
 
       _gemini.sendText(hint);
-      _lastHintLabel = label;
+      _lastHintLabel = objectLabel;
       _lastMemoryHintAt = now;
       if (mounted) {
         setState(() {
           _aiAction = 'Using saved memory to guide search';
         });
       }
-    } catch (_) {
-      // Ignore memory lookup failures to avoid interrupting real-time assistance.
+    } catch (error) {
+      debugPrint('[MemoryHint] lookup failed for "$objectLabel": $error');
+      if (mounted) {
+        setState(() {
+          _aiAction = 'Memory lookup failed';
+        });
+      }
     }
   }
 
   List<String> _extractLabels(String text) {
     final labels = <String>[];
+    final markerPattern = RegExp(
+      r"memory_label\s*:\s*([a-z0-9'\- ]{2,60})",
+      caseSensitive: false,
+    );
+    for (final match in markerPattern.allMatches(text)) {
+      final normalized = _canonicalObjectLabel(match.group(1) ?? '');
+      if (normalized.isNotEmpty && !labels.contains(normalized)) {
+        labels.add(normalized);
+      }
+    }
+
     final bracketPattern = RegExp(r'\[([^\]]+)\]');
     for (final match in bracketPattern.allMatches(text)) {
       final content = (match.group(1) ?? '').trim();
@@ -896,6 +1017,86 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return withoutArticles;
   }
 
+  bool _isMeaningfulObjectLabel(String value) {
+    final normalized = _normalizeLabel(value);
+    if (normalized.isEmpty) {
+      return false;
+    }
+    if (normalized.length < 3) {
+      return false;
+    }
+    const genericLabels = {
+      'object',
+      'item',
+      'thing',
+      'stuff',
+      'belonging',
+      'property',
+      "user's object",
+      "other person's object",
+    };
+    if (genericLabels.contains(normalized)) {
+      return false;
+    }
+    return true;
+  }
+
+  String _canonicalObjectNameLabel(String value) {
+    final contextual = _canonicalObjectLabel(value);
+    if (contextual.isEmpty) {
+      return '';
+    }
+    return _recognitionObjectName(contextual);
+  }
+
+  String _recognitionObjectName(String label) {
+    const genericObjectNames = {
+      'object',
+      'item',
+      'thing',
+      'stuff',
+      'belonging',
+      'property',
+    };
+
+    final text = _normalizeLabel(label)
+        .replaceFirst("user's ", '')
+        .replaceFirst("other person's ", '')
+        .replaceFirst("someone else's ", '');
+
+    if (genericObjectNames.contains(text)) {
+      return '';
+    }
+
+    final words = text
+        .split(' ')
+        .where((word) => word.isNotEmpty)
+        .where((word) => !const {
+              'this',
+              'that',
+              'it',
+              'is',
+              'are',
+              'near',
+              'at',
+              'on',
+              'in',
+              'to',
+              'of',
+            }.contains(word))
+        .toList(growable: false);
+
+    if (words.isEmpty) {
+      return '';
+    }
+
+    final joined = words.take(3).join(' ');
+    if (genericObjectNames.contains(joined)) {
+      return '';
+    }
+    return joined;
+  }
+
   String _extractOwnershipLabel(String text) {
     final userPatterns = <RegExp>[
       RegExp(r"\b(?:this|that|it)(?:'s| is)?\s+my\s+([a-z0-9 ]{2,40})"),
@@ -947,6 +1148,69 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final object = _normalizeLabel(match.group(1) ?? '');
       if (object.isNotEmpty) {
         return _canonicalObjectLabel(object);
+      }
+    }
+    return '';
+  }
+
+  String _extractPossessiveMentionLabel(String text) {
+    final quotedPatterns = <RegExp>[
+      RegExp('["\']my\\s+([a-z0-9]+(?:\\s+[a-z0-9]+){0,2})["\']'),
+      RegExp('["\']your\\s+([a-z0-9]+(?:\\s+[a-z0-9]+){0,2})["\']'),
+    ];
+    for (final pattern in quotedPatterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final object = _normalizeLabel(match.group(1) ?? '');
+      if (object.isNotEmpty) {
+        return _canonicalObjectLabel("user's $object");
+      }
+    }
+
+    final plainPatterns = <RegExp>[
+      RegExp(r"\bmy\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,2})"),
+      RegExp(r"\byour\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,2})"),
+      RegExp(r"\btheir\s+([a-z0-9]+(?:\s+[a-z0-9]+){0,2})"),
+    ];
+    for (final pattern in plainPatterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      final object = _normalizeLabel(match.group(1) ?? '');
+      if (object.isNotEmpty) {
+        return _canonicalObjectLabel("user's $object");
+      }
+    }
+
+    return '';
+  }
+
+  String _extractExplicitSaveLabel(String text) {
+    final patterns = <RegExp>[
+      RegExp(r"\bsave\s+this\s+object\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+this\s+item\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+as\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+my\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+the\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bsave\s+([a-z0-9' ]{2,50})"),
+      RegExp(r"\bremember\s+my\s+([a-z0-9' ]{2,50})"),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(text);
+      if (match == null) {
+        continue;
+      }
+      var raw = _normalizeLabel(match.group(1) ?? '');
+      raw = raw
+          .replaceFirst(RegExp(r'^(object|item|thing)\s+as\s+'), '')
+          .replaceFirst(RegExp(r'^(object|item|thing)\s+'), '')
+          .trim();
+      final label = _canonicalObjectLabel(raw);
+      if (label.isNotEmpty) {
+        return label;
       }
     }
     return '';

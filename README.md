@@ -148,6 +148,45 @@ gcloud builds submit --config cloudbuild.yaml --substitutions=_GEMINI_API_KEY=YO
 
 ### Health check
 
+## Reproducible Testing
+
+To thoroughly test the AEyes application, follow these steps to verify both the local app and the cloud backend.
+
+### 1. Prerequisites
+- A physical Android or iOS device (emulators may not support camera and microphone features required for Gemini Live).
+- Flutter SDK installed and on your PATH.
+- Google Cloud CLI installed and authenticated (if testing the backend).
+
+### 2. Backend Testing (Optional but recommended)
+If you have deployed the backend using the instructions above, verify it is running:
+```bash
+curl https://your-cloud-run-url/health
+```
+Expected output should be a successful JSON response indicating the service is up.
+
+### 3. Testing the Mobile App
+1. Connect your physical device.
+2. In the project root, ensure dependencies are installed:
+   ```bash
+   flutter pub get
+   ```
+3. Run the application:
+   ```bash
+   flutter run
+   ```
+4. **Permissions:** Upon first launch, accept the Camera and Microphone permissions.
+5. **Start Session:** Tap the "Start" button to initiate a Gemini Live session.
+6. **Room Scan:** Slowly pan the camera around your environment. The debug overlay should show scene summaries being generated.
+7. **Voice Interaction:** Speak to the agent (e.g., "What is in front of me?" or "Are there any obstacles?"). You should receive a spoken response from the Gemini Live agent.
+8. **Test Safety Constraints:** Intentionally point the camera at a potentially hazardous object (like a chair leg or a stair edge) and ask if it's safe to walk forward. The agent should prioritize safety and warn you.
+
+### 4. Running Unit Tests
+To run the automated test suite for the Flutter app:
+```bash
+flutter test
+```
+This will execute the tests in the `test/` directory, including audio, camera frame, and gemini live service tests.
+
 Use:
 
 ```bash
